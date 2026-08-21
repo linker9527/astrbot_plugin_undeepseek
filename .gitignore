@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.wasm
+tokenizer.json
+.DS_Store
+Thumbs.db

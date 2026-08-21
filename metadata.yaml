@@ -1,0 +1,8 @@
+name: 免费deepseek api key
+desc: DeepSeek 逆向 API 提供商（通过网页端账号，无需 API Key）
+author: linker9527
+version: 1.0.1
+repo: ""
+pages:
+  - name: deepseek_reverse
+    title: DeepSeek 配置
