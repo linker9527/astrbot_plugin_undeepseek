@@ -333,6 +333,8 @@ class ProviderDeepSeekReverse(Provider):
 
     def _ensure_initialized(self):
         """延迟初始化账号池（等 Star 类通过 _conf_schema 注入配置后）"""
+        # 浏览器模式开关（在覆盖 config.CONFIG 前读取并缓存到实例）
+        self._avoid_ban = bool(config.CONFIG.get("avoid_ban", False))
         if self._initialized:
             return
 
@@ -358,6 +360,7 @@ class ProviderDeepSeekReverse(Provider):
         config.CONFIG = {
             "accounts": accounts,
             "keys": self._provider_config.get("key", ["linker9527"]),
+            "avoid_ban": self._avoid_ban,
         }
         if not _ACCOUNT_POOL_INITIALIZED:
             account.init_account_queue()
@@ -605,6 +608,78 @@ class ProviderDeepSeekReverse(Provider):
                 self._delete_session(acct, session_id)
             account.release_account(acct)
 
+    # -- 浏览器模式（避免封控）-----------------------------------------
+    def _browser_credentials(self) -> tuple:
+        """浏览器模式取账号：优先走账号池（最空闲优先 + 跳过风控号），支持换号。"""
+        try:
+            acct = account.choose_new_account([])
+            if acct:
+                identifier = acct.get("email") or acct.get("mobile") or ""
+                pwd = acct.get("password", "")
+                if identifier and pwd:
+                    return identifier, pwd
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Browser] 从账号池取号失败，回退单值: {e}")
+        acct_str = str(config.CONFIG.get("account", "") or "").strip()
+        pwd = str(config.CONFIG.get("password", "") or "").strip()
+        return acct_str, pwd
+
+    @staticmethod
+    def _extract_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+            return chr(10).join(p for p in parts if p)
+        return ""
+
+    @classmethod
+    def _build_browser_prompt(cls, messages) -> str:
+        """把 AstrBot 维护的完整上下文（用户/助手对话）注入到浏览器消息里，
+        让网页端模型能看到上文，而不是只看到最后一条。"""
+        lines = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            txt = cls._extract_text(m.get("content", "")).strip()
+            if not txt:
+                continue
+            who = "用户" if role == "user" else "助手"
+            lines.append(f"{who}: {txt}")
+        return chr(10).join(lines)
+
+    async def _browser_chat(self, messages) -> LLMResponse:
+        from core import browser as browser_mod
+        user_text = self._build_browser_prompt(messages)
+        logger.info("[Browser] 浏览器模式对话开始")
+        tried = set()
+        for attempt in range(6):
+            acct, pwd = self._browser_credentials()
+            if not acct or not pwd:
+                raise Exception("浏览器模式无可用账号（未配置 DeepSeek 账号）")
+            if acct in tried:
+                break
+            tried.add(acct)
+            try:
+                text = await browser_mod.chat(acct, pwd, user_text)
+                resp = LLMResponse("assistant")
+                resp.completion_text = text or ""
+                resp.usage = TokenUsage(input_other=0, input_cached=0, output=count_tokens(text or ""))
+                return resp
+            except browser_mod.AccountBannedError as e:
+                logger.warning(f"[Browser] 账号 {acct} 被禁言，自动换号重试: {e}")
+                continue
+            except Exception:
+                raise
+        raise Exception("浏览器模式所有账号均被禁言或不可用，请检查账号状态后重试")
+
+    async def _browser_chat_stream(self, messages):
+        resp = await self._browser_chat(messages)
+        yield resp
+
     # -- text_chat（非流式）--------------------------------------------
     async def text_chat(
         self,
@@ -627,6 +702,10 @@ class ProviderDeepSeekReverse(Provider):
         messages = self._build_messages(
             prompt, contexts, system_prompt, func_tool, tool_choice, tool_calls_result
         )
+
+        # 浏览器模式（避免封控）：纯对话，不支持 agent/工具调用
+        if self._avoid_ban:
+            return await self._browser_chat(messages)
 
         text, reasoning, prompt_tokens = await asyncio.to_thread(
             self._do_completion_sync, messages, model
@@ -678,6 +757,12 @@ class ProviderDeepSeekReverse(Provider):
         messages = self._build_messages(
             prompt, contexts, system_prompt, func_tool, tool_choice, tool_calls_result
         )
+
+        # 浏览器模式（避免封控）：非流式，单块输出
+        if self._avoid_ban:
+            async for _r in self._browser_chat_stream(messages):
+                yield _r
+            return
 
         import queue as _stdq
 
@@ -831,7 +916,11 @@ class Main(Star):
         if not accounts:
             self.logger.warning("[插件初始化] 没有配置任何账号！请在 WebUI 插件配置中填写 DeepSeek 账号和密码")
 
-        ds_config.CONFIG = {"accounts": accounts, "keys": ["linker9527"]}
+        ds_config.CONFIG = {
+            "accounts": accounts,
+            "keys": ["linker9527"],
+            "avoid_ban": bool(config.get("avoid_ban", False)),
+        }
         ds_account.init_account_queue()
         self.logger.info(f"[插件初始化] 配置已加载至 ds_config.CONFIG: {len(accounts)} 个账号，账号池已初始化")
 

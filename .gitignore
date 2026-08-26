@@ -5,3 +5,6 @@ __pycache__/
 tokenizer.json
 .DS_Store
 Thumbs.db
+# 登录态/临时文件不推送
+storage_state*.json
+image/

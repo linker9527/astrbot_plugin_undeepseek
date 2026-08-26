@@ -1,5 +1,8 @@
+import json
 import logging
 import random
+import socket
+import ssl
 import time
 
 from curl_cffi import requests
@@ -124,7 +127,49 @@ def login_deepseek_via_account(account):
 # ----------------------------------------------------------------------
 # HIF 令牌获取
 # ----------------------------------------------------------------------
-def fetch_hif_token(session, url, token_name):
+def _fetch_hif_via_socket(url, token_name, account):
+    """DNS 被污染时的兜底：手动 socket 连接备用 IP + 正确 SNI 拿 token。"""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname
+    path = parsed.path or "/"
+    backup_ip = "60.204.2.4"
+    auth = ""
+    if account and account.get("token"):
+        auth = f"Bearer {account['token']}"
+    try:
+        ctx = ssl.create_default_context()
+        raw = socket.create_connection((backup_ip, 443), timeout=15)
+        with ctx.wrap_socket(raw, server_hostname=host) as s:
+            req_lines = [f"GET {path} HTTP/1.1", f"Host: {host}", "Connection: close"]
+            if auth:
+                req_lines.append(f"Authorization: {auth}")
+            CRLF = chr(13) + chr(10)
+            req = (CRLF.join(req_lines) + CRLF + CRLF).encode()
+            s.sendall(req)
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        head, _, body = data.partition(bytes([13,10,13,10]))
+        status = head.decode(errors="ignore").split(chr(13)+chr(10))[0]
+        if "200" not in status:
+            logger.warning(f"[fetch_hif_token] 兜底 {token_name} {status}")
+            return None
+        data_json = json.loads(body)
+        value = data_json.get("data", {}).get("biz_data", {}).get("value")
+        if value:
+            logger.info(f"[fetch_hif_token] 兜底成功获取 {token_name}")
+            return value
+        logger.warning(f"[fetch_hif_token] 兜底 {token_name} 响应缺少 value: {data_json}")
+    except Exception as e:
+        logger.error(f"[fetch_hif_token] 兜底 {token_name} 异常: {e}")
+    return None
+
+
+def fetch_hif_token(session, url, token_name, account=None):
     try:
         resp = session.get(
             url,
@@ -147,6 +192,10 @@ def fetch_hif_token(session, url, token_name):
             logger.warning(f"[fetch_hif_token] {token_name} HTTP {resp.status_code}")
         resp.close()
     except Exception as e:
+        err = str(e)
+        if "resolve host" in err or "DNSError" in type(e).__name__:
+            logger.warning(f"[fetch_hif_token] {token_name} DNS 解析失败，启用 IP 兜底")
+            return _fetch_hif_via_socket(url, token_name, account)
         logger.error(f"[fetch_hif_token] {token_name} 异常: {e}")
     return None
 
@@ -162,8 +211,8 @@ def ensure_hif_tokens(account, force=False):
     session = session_module.get_account_session(account)
 
     logger.info(f"[ensure_hif_tokens] 账号 {constants.get_account_identifier(account)} 开始获取 HIF 令牌")
-    dliq = fetch_hif_token(session, constants.HIF_DLIQ_URL, "x-hif-dliq")
-    leim = fetch_hif_token(session, constants.HIF_LEIM_URL, "x-hif-leim")
+    dliq = fetch_hif_token(session, constants.HIF_DLIQ_URL, "x-hif-dliq", account)
+    leim = fetch_hif_token(session, constants.HIF_LEIM_URL, "x-hif-leim", account)
 
     if dliq:
         account["hif_dliq"] = dliq
