@@ -2,7 +2,7 @@ name: astrbot_plugin_undeepseek
 display_name: 免费deepseek api key
 desc: DeepSeek 逆向 API 提供商（通过网页端账号，无需 API Key）
 author: linker9527
-version: 1.1.0
+version: 1.1.1
 repo: https://github.com/linker9527/astrbot_plugin_undeepseek
 pages:
   - name: deepseek_reverse
