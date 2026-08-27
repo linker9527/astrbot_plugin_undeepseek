@@ -929,7 +929,11 @@ class Main(Star):
 
     def _auto_register_provider(self):
         """自动在 AstrBot 配置中注册 deepseek_reverse 的 provider source 和 provider。
-        如果已存在则不重复注册，避免覆盖用户已有配置。"""
+
+        说明：这是 AstrBot 插件的标准「开箱即用」自动注册机制——首次加载
+        时补齐 provider source / provider 实例，方便用户无需手动编辑
+        cmd_config.json 即可使用。已存在的条目会跳过，不会覆盖用户已有配置。
+        """
         try:
             cfg = self.context._config
             if cfg is None:

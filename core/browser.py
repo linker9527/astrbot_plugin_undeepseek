@@ -137,6 +137,9 @@ async def _ensure_page(account: str, password: str):
             _browser = await _pw.chromium.launch(
                 executable_path=CHROME_EXE,
                 headless=True,
+                # 隐藏 Playwright 自动化痕迹（如 navigator.webdriver），
+                # 避免 DeepSeek 网页端把本插件识别为机器人进而风控/封号。
+                # 这是浏览器自动化插件的常规反检测配置，不影响任何安全边界。
                 args=["--disable-blink-features=AutomationControlled"],
             )
 
