@@ -1,10 +1,24 @@
+# 调试脚本（含真实账号，禁止提交）
+diag_*.py
+diag_*.*
+backup/
+image/
+browser_err.log
+*.bak
+*.bak_*
+*.log
+
+# 临时/系统文件
 __pycache__/
 *.pyc
-*.pyo
-*.wasm
-tokenizer.json
 .DS_Store
 Thumbs.db
-# ��¼̬/��ʱ�ļ�������
+# 浏览器登录态（含 cookie/token，禁止提交）
 storage_state*.json
-image/
+*.wasm
+
+# 本地报告
+浏览器模式bug修复报告.md
+
+# 分词器数据（6.5MB，运行时下载）
+tokenizer.json

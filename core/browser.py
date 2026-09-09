@@ -12,6 +12,7 @@
 - 选择器已按真实网页实测校准（2026-08-26）。
 """
 
+import re
 import asyncio
 import logging
 import os
@@ -20,8 +21,29 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 logger = logging.getLogger("DeepSeekReverse.browser")
 
-# 完整 Chrome 内核（Playwright 自带 node 有 UNC 长路径 bug，故手动下载解压）
-CHROME_EXE = r"C:\Users\ning\AppData\Local\ms-playwright\chromium-1234\chrome-win64\chrome.exe"
+# 浏览器可执行文件：自动探测 Playwright 安装的 Chromium，并允许通过
+# 环境变量 UNDEEPSEEK_CHROME 覆盖（不同机器路径不同）。
+# Playwright 自带 node 有 UNC 长路径 bug，故优先手动下载解压的完整 chrome。
+import glob as _glob
+
+def _find_chrome() -> str:
+    # 1) 环境变量显式指定
+    env = os.environ.get("UNDEEPSEEK_CHROME", "").strip()
+    if env and os.path.exists(env):
+        return env
+    # 2) 常见 Playwright chromium 安装目录下探测 chrome.exe
+    patterns = [
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright", "chromium-*", "chrome-win64", "chrome.exe"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright", "chromium-*", "chrome-win", "chrome.exe"),
+        os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright", "chromium-*", "chrome-linux", "chrome"),
+    ]
+    for pat in patterns:
+        matches = sorted(_glob.glob(pat))
+        if matches:
+            return matches[0]
+    return ""
+
+CHROME_EXE = _find_chrome()
 DEEPSEEK_URL = "https://chat.deepseek.com/"
 
 # 登录态按账号分文件持久化（避免换号时互相覆盖）
@@ -38,17 +60,37 @@ def _storage_path(identifier: str) -> str:
 # ---------------------------------------------------------------------------
 try:
     from playwright._impl import _driver as _pd
+    from playwright._impl import _transport as _tr
+
+    _orig_compute_driver = _pd.compute_driver_executable  # 保存原始函数，避免递归
+    _orig_get_driver_env = _pd.get_driver_env
+
+    def _clean_unc(v: str) -> str:
+        """去掉路径里的 \\?\\<盘符>:\\ UNC 长路径前缀，还原成 <盘符>:\\。"""
+        import re as _re
+        # 通用正则：把 \\\\?\\\\C:\\ 还原成 C:\\（不硬编码 E: 盘）
+        return _re.sub(r"^\\\\\?\\\\?([A-Za-z]:)", r"\1", v)
 
     def _compute_driver_executable_patched():
-        node, cli = _pd.compute_driver_executable()
-        _pre = "\\\\?\\"
-        if node.startswith(_pre):
-            node = node[len(_pre):]
-        if cli.startswith(_pre):
-            cli = cli[len(_pre):]
-        return node, cli
+        node, cli = _orig_compute_driver()
+        return _clean_unc(node), _clean_unc(cli)
 
+    def _get_driver_env_patched() -> dict:
+        env = _orig_get_driver_env()
+        # 清理 env 里所有变量中的 UNC 前缀（PATH / PYTHONPATH 等）
+        for _pk in list(env.keys()):
+            if "\\?\\" in env[_pk]:
+                env[_pk] = _clean_unc(env[_pk])
+        return env
+
+    # playwright._transport 是 `from ._driver import compute_driver_executable`，
+    # 直接把函数绑定到自身命名空间，所以只改 _driver 不生效，必须连 _transport 一起改。
     _pd.compute_driver_executable = _compute_driver_executable_patched
+    _pd.get_driver_env = _get_driver_env_patched
+    if hasattr(_tr, "compute_driver_executable"):
+        _tr.compute_driver_executable = _compute_driver_executable_patched
+    if hasattr(_tr, "get_driver_env"):
+        _tr.get_driver_env = _get_driver_env_patched
 except Exception as _e:  # noqa: BLE001
     logger.warning("[Browser] 驱动路径 patch 失败: %s", _e)
 
@@ -67,8 +109,8 @@ class AccountBannedError(Exception):
     """账号被禁言（风控）异常，触发换号。"""
 
 
-# 禁言提示的精确信号词（正常回复几乎不会出现，避免误判换号）
-BAN_KEYWORD = "已被禁言"
+# 禁言提示的精确信号词（匹配完整提示句，越长越不容易误命中正常提示）
+BAN_KEYWORD = "由于违法用户使用规范，你的账号已被禁言至"
 
 # 全局单例（跨请求复用浏览器与登录态）
 _pw = None
@@ -77,6 +119,8 @@ _context = None
 _page = None
 _current_account = None
 _lock = asyncio.Lock()
+# 强制重建标志：被顶会话/超时后置位，让下一次 _ensure_page 跳过复用、重新登录
+_force_rebuild = False
 
 
 async def _is_logged_in(page) -> bool:
@@ -121,22 +165,52 @@ async def _do_login(page, account: str, password: str):
 
 async def _ensure_page(account: str, password: str):
     """确保浏览器已打开并处于登录状态，返回 page。"""
-    global _pw, _browser, _context, _page, _current_account
+    global _pw, _browser, _context, _page, _current_account, _force_rebuild
     async with _lock:
-        # 仅当页面存活且当前登录账号一致时才复用（否则重建以支持换号）
-        if _page is not None and not _page.is_closed() and _current_account == account:
+        # 仅当页面存活且当前登录账号一致且未标记强制重建时才复用
+        if (not _force_rebuild and _page is not None and not _page.is_closed()
+                and _current_account == account):
             try:
                 await _page.title()  # 探活
                 return _page
             except Exception:
                 pass
+        _force_rebuild = False  # 消费掉重建标记
         _current_account = account
 
+        # Bug4: 换号/重建页面会丢失网页端上下文，清空活跃会话集合，
+        # 让后续同 session 请求重新喂入历史，避免上下文断裂。
+        _active_sessions.clear()
+
+        # Bug5: 关闭上一个账号的旧 context（换号重建时避免 context/页面泄漏）
+        if _context is not None:
+            try:
+                await _context.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _context = None
+            _page = None
+
         if _browser is None or not _browser.is_connected():
+            # Playwright 子进程会继承带 \\?\ 前缀的 PATH（AstrBot 嵌入 E 盘所致），
+            # node 遇到该 UNC 前缀会报 EISDIR 启动失败。这里给子进程一份干净的
+            # PATH（把 \\?\E:\ 还原成 E:\），并在重启前记录一条日志便于排查。
+            _launch_env = dict(os.environ)
+            _changed = False
+            for _pkey in list(_launch_env.keys()):
+                if _pkey.upper() == "PATH":
+                    _pv = _launch_env[_pkey]
+                    _clean = re.sub(r"^\\\\\?\\\\?([A-Za-z]:)", r"\1", _pv)
+                    if _clean != _pv:
+                        _launch_env[_pkey] = _clean
+                        _changed = True
+            if not _changed:
+                _launch_env = None
             _pw = await async_playwright().start()
             _browser = await _pw.chromium.launch(
                 executable_path=CHROME_EXE,
                 headless=True,
+                env=_launch_env,
                 # 隐藏 Playwright 自动化痕迹（如 navigator.webdriver），
                 # 避免 DeepSeek 网页端把本插件识别为机器人进而风控/封号。
                 # 这是浏览器自动化插件的常规反检测配置，不影响任何安全边界。
@@ -156,7 +230,6 @@ async def _ensure_page(account: str, password: str):
                 viewport={"width": 1280, "height": 800},
                 locale="zh-CN",
             )
-
         _page = await _context.new_page()
         await _page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=60000)
 
@@ -169,10 +242,25 @@ async def _ensure_page(account: str, password: str):
                 logger.warning("[Browser] 保存登录态失败: %s", _e)
 
         # 登录后检测禁言提示（如账号已被禁言则抛异常触发换号）
+        # 注意：只在可见的提示框/toast 里检测，不扫整个 body（避免误命中帮助文本等）
         try:
-            _body = await _page.locator("body").inner_text()
-            if BAN_KEYWORD in _body:
-                raise AccountBannedError(f"账号 {account} 已被禁言")
+            await _page.wait_for_timeout(2000)  # 等 2 秒让页面完全加载
+            # 只检查 toast / 消息提示框 / dialog 类元素
+            ban_els = _page.locator(
+                ".ant-message, .ant-notification, .ant-modal-body, "
+                ".toast, .alert, [role='alert'], [class*='toast'], [class*='message']"
+            )
+            n = await ban_els.count()
+            for i in range(n):
+                try:
+                    t = await ban_els.nth(i).inner_text()
+                    if BAN_KEYWORD in t:
+                        logger.warning(f"[Browser] 检测到禁言提示，触发换号: {t[:80]}")
+                        raise AccountBannedError(t[:200])
+                except AccountBannedError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
         except AccountBannedError:
             raise
         except Exception:  # noqa: BLE001
@@ -181,48 +269,137 @@ async def _ensure_page(account: str, password: str):
         return _page
 
 
-async def _wait_reply(page, timeout: int):
-    """等待回复生成完成：轮询 markdown 内容稳定出现。"""
+async def _wait_reply(page, timeout: int, base_count: int = 0):
     import time as _t
     deadline = _t.time() + timeout
     last = ""
+    stable = 0
+    _bl = 0
+    _bls = 0
+    try:
+        await page.wait_for_timeout(1500)
+        _bl = len(await page.locator("body").inner_text())
+    except Exception:
+        pass
+    _lastl = _bl
     while _t.time() < deadline:
-        # 禁言检测：命中精确信号词立即抛异常触发换号
         try:
-            _body = await page.locator("body").inner_text()
-            if BAN_KEYWORD in _body:
-                raise AccountBannedError("账号已被禁言")
+            ban_els = page.locator(".ant-message, .ant-notification, .toast, .alert, [role='alert']")
+            bn = await ban_els.count()
+            for bi in range(bn):
+                bt = await ban_els.nth(bi).inner_text()
+                if BAN_KEYWORD in bt:
+                    logger.warning("[Browser] ban: %s", bt[:80])
+                    raise AccountBannedError(bt[:200])
         except AccountBannedError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
+        text = None
         try:
             blocks = page.locator(SEL_REPLY)
             n = await blocks.count()
-            if n:
-                txt = (await blocks.nth(n - 1).inner_text()).strip()
-                if txt:
-                    if txt == last:
-                        # 内容连续两次相同，视为生成完成
-                        return txt
-                    last = txt
+            if n > base_count:
+                text = (await blocks.nth(n - 1).inner_text()).strip()
         except Exception:
-            pass
-        await page.wait_for_timeout(3000)
-    return last
+            text = None
+        if not text:
+            try:
+                cur = await page.locator("body").inner_text()
+                cl = len(cur)
+                if cl == _lastl:
+                    _bls += 1
+                    if _bls >= 6 and cl > _bl:
+                        text = cur[_bl:].strip()
+                else:
+                    _lastl = cl
+                    _bls = 0
+            except Exception:
+                pass
+        if text:
+            if text == last:
+                stable += 1
+                if stable >= 6:
+                    return text
+            else:
+                last = text
+                stable = 0
+        await page.wait_for_timeout(800)
+    if last:
+        return last
+    raise TimeoutError("wait timeout %ss" % timeout)
 
 
-async def chat(account: str, password: str, user_text: str, timeout: int = 180) -> str:
-    """在浏览器里发一条消息并抓取完整回复文本（纯对话，不支持工具调用）。"""
-    page = await _ensure_page(account, password)
 
+_active_sessions: set = set()
+
+
+async def _send(page, text: str) -> int:
+    """向输入框发送一条消息，返回发送前已有的回复块数（作为新回复的基准）。"""
+    base = 0
+    try:
+        base = await page.locator(SEL_REPLY).count()
+    except Exception:
+        pass
     box = page.locator(SEL_CHAT_INPUT).last
     await box.click()
-    await box.fill(user_text)
-    await box.press("Enter")  # 深求无发送按钮，回车发送
+    await box.fill(text)
+    try:
+        await box.evaluate(
+            """(el) => {
+                const proto = el.tagName === 'TEXTAREA'
+                    ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                setter.call(el, el.value);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+            }"""
+        )
+    except Exception:
+        pass
+    await box.press("Enter")
+    return base
 
-    text = await _wait_reply(page, timeout)
-    return text
+
+async def chat(
+    account: str,
+    password: str,
+    history_prompt: str,
+    latest_prompt: str,
+    session_id=None,
+    timeout: int = 300,
+) -> str:
+    """在浏览器里对话。
+
+    会话(session_id)首次：先喂完整历史（丢弃其回复），再发最新问题并返回答案。
+    会话后续：复用同一页面，只发最新消息（网页端自己记住历史），上下文连续、不反复新建。
+    """
+    global _force_rebuild
+    page = await _ensure_page(account, password)
+
+    is_first = bool(session_id) and session_id not in _active_sessions
+    if is_first:
+        _active_sessions.add(session_id)
+        # 首次：先发历史作为上下文（不返回它的回复），再发最新问题
+        if history_prompt.strip():
+            logger.info(f"[Browser] 会话 {session_id} 首次，喂入历史 {len(history_prompt)} 字")
+            _base = await _send(page, history_prompt)
+            try:
+                await _wait_reply(page, 30, _base)
+            except TimeoutError:
+                pass
+        else:
+            logger.info(f"[Browser] 会话 {session_id} 首次，无历史，直接发问题")
+
+    # 发最新问题并返回回复
+    base = await _send(page, latest_prompt)
+    try:
+        text = await _wait_reply(page, timeout, base)
+        return text
+    except TimeoutError:
+        # 会话被顶/超时：标记强制重建，让下次 _ensure_page 重新登录
+        _force_rebuild = True
+        raise
 
 
 async def close():
