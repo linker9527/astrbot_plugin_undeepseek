@@ -16,11 +16,6 @@ MAX_RETRIES = 6
 RETRY_DELAYS = [1, 2, 4, 8, 16, 32]  # 秒
 
 # ----------------------------------------------------------------------
-# 滑动窗口工具调用检测参数
-# ----------------------------------------------------------------------
-SLIDING_WINDOW_SIZE = 19  # 足够容纳 <tool_call> 前缀
-
-# ----------------------------------------------------------------------
 # JSON 修复工具
 # ----------------------------------------------------------------------
 def repair_invalid_backslashes(text: str) -> str:
@@ -83,7 +78,8 @@ def repair_unquoted_keys(text: str) -> str:
             while i < n and text[i].isspace():
                 result.append(text[i])
                 i += 1
-            if i < n and text[i] != '"':
+            # 空容器（{} / {,}）或即将闭合时不能补引号，否则 {} 会被破坏成 {""}
+            if i < n and text[i] not in ('"', '}', ']'):
                 result.append('"')
                 while i < n and text[i] not in ('"', ':', '}', ']') and not (text[i].isspace() and i + 1 < n and text[i + 1] == ':'):
                     result.append(text[i])
@@ -953,7 +949,15 @@ def detect_and_parse_tool_calls(content: str):
             continue
 
         if isinstance(parsed, list):
-            valid_calls = _normalize_tool_calls(parsed)
+            # 仅接受 OpenAI function-call 形态的列表项（带 function.name），
+            # 避免普通 JSON 数组（如 [{"name": "张三", ...}]）被误判为工具调用
+            if parsed and all(
+                isinstance(it, dict)
+                and isinstance(it.get("function"), dict)
+                and it["function"].get("name")
+                for it in parsed
+            ):
+                valid_calls = _normalize_tool_calls(parsed)
         elif not isinstance(parsed, dict):
             continue
         elif "tool_calls" in parsed:
@@ -962,8 +966,11 @@ def detect_and_parse_tool_calls(content: str):
             valid_calls = _normalize_tool_calls(parsed.get("tool_uses"))
         elif "tool_use" in parsed:
             valid_calls = _normalize_tool_calls(parsed.get("tool_use"))
+        elif isinstance(parsed.get("function"), dict) and parsed["function"].get("name"):
+            valid_calls = _normalize_tool_calls([parsed])
         else:
-            valid_calls = _normalize_tool_calls(parsed)
+            # 普通对象（如 {"name": "张三", "age": 30}）不是工具调用，跳过
+            continue
 
         if valid_calls:
             remaining_content = (content_clean[:start] + content_clean[end:]).strip()
@@ -999,6 +1006,15 @@ def call_completion_endpoint(payload, headers, session, max_attempts=MAX_RETRIES
 
         if deepseek_resp.status_code == 200:
             return deepseek_resp
+
+        # 401/403 属于 token 失效/无权限，重试无意义，
+        # 直接返回 None 让上层走失败计数与重新登录
+        if deepseek_resp.status_code in (401, 403):
+            logger.warning(
+                f"[call_completion_endpoint] 状态码 {deepseek_resp.status_code}，token 可能失效，停止重试"
+            )
+            deepseek_resp.close()
+            return None
 
         # 429 或 503 是 overload 信号，使用更长退避
         if deepseek_resp.status_code in (429, 503):
@@ -1075,11 +1091,9 @@ def create_session(request, max_attempts=MAX_RETRIES):
             release_account(request.state.account)
             new_account = choose_new_account(request.state.tried_accounts)
             if new_account is None:
-                wait = RETRY_DELAYS[min(attempts, len(RETRY_DELAYS) - 1)]
-                logger.warning(f"[create_session] 无可用账号，等待 {wait}s 后重试")
-                time.sleep(wait)
-                attempts += 1
-                continue
+                # 无可用账号：旧账号已释放，继续重试只会用失效 token 白耗次数
+                logger.warning("[create_session] 无可用账号，停止重试")
+                break
             try:
                 login_deepseek_via_account(new_account)
             except Exception as e:

@@ -153,23 +153,26 @@ def _consume_sse_full(resp) -> tuple[str, str, bool]:
                 continue
 
             # 旧格式：路径标记
-            if chunk.get("p") == "response/thinking_content":
+            p = chunk.get("p")
+            if p == "response/thinking_content":
                 current_ptype = "thinking"
-            elif chunk.get("p") == "response/content":
+            elif p == "response/content":
                 current_ptype = "text"
 
-            if chunk.get("p") == "response/status":
+            if p == "response/status":
                 if chunk.get("v") == "FINISHED":
                     finished = True
                     break
                 continue
-            if chunk.get("p") == "response/search_status":
+            if p == "response/search_status":
                 continue
 
-            # v 字段
+            # v 字段：仅接受白名单路径或无路径的纯增量 chunk，
+            # 其它路径（如 fragments[N]/status 的 "FINISHED"）不得混入正文
             v = chunk.get("v")
             if isinstance(v, str):
-                (think_parts if current_ptype == "thinking" else text_parts).append(v)
+                if p is None or p in ("response/content", "response/thinking_content"):
+                    (think_parts if current_ptype == "thinking" else text_parts).append(v)
             elif isinstance(v, list):
                 if any(isinstance(it, dict) and it.get("p") == "status" and it.get("v") == "FINISHED" for it in v):
                     finished = True
@@ -231,22 +234,25 @@ def _consume_sse_chunks(resp, q) -> bool:
                             q.put((cp, fc))
                 continue
 
-            if chunk.get("p") == "response/thinking_content":
+            p = chunk.get("p")
+            if p == "response/thinking_content":
                 current_ptype = "thinking"
-            elif chunk.get("p") == "response/content":
+            elif p == "response/content":
                 current_ptype = "text"
 
-            if chunk.get("p") == "response/status":
+            if p == "response/status":
                 if chunk.get("v") == "FINISHED":
                     finished = True
                     break
                 continue
-            if chunk.get("p") == "response/search_status":
+            if p == "response/search_status":
                 continue
 
+            # 与 _consume_sse_full 相同的白名单策略，避免未知路径污染输出
             v = chunk.get("v")
             if isinstance(v, str):
-                q.put((current_ptype, v))
+                if p is None or p in ("response/content", "response/thinking_content"):
+                    q.put((current_ptype, v))
             elif isinstance(v, list):
                 if any(isinstance(it, dict) and it.get("p") == "status" and it.get("v") == "FINISHED" for it in v):
                     finished = True
@@ -628,6 +634,9 @@ class ProviderDeepSeekReverse(Provider):
                 if identifier and pwd:
                     # 返回账号 dict 本体（保留 _guard），供调用方用 release_account 释放
                     return acct, identifier, pwd
+                # 缺密码的池账号不可用：必须释放，否则会永久占用池子
+                logger.warning(f"[Browser] 池账号 {identifier} 缺少密码，已释放并回退单值配置")
+                account.release_account(acct)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[Browser] 从账号池取号失败，回退单值: {e}")
         acct_str = str(config.CONFIG.get("account", "") or "").strip()
@@ -669,8 +678,11 @@ class ProviderDeepSeekReverse(Provider):
             "seamless continuation of the work",
         ]
         low = cleaned.lower()
+        # 模板短语只匹配消息开头区域：这些模板均以短语开头，
+        # 全文匹配会把恰好含相同短语的正常用户消息整条误杀
+        head = low[:200]
         for ph in meta_phrases:
-            if ph in low:  # 任意位置命中即整条丢弃（泄漏的模板常被拼成"用户: ..."前缀）
+            if ph in head:  # 开头命中即整条丢弃（泄漏的模板常被拼成"用户: ..."前缀）
                 return ""
         return cleaned
 
@@ -705,11 +717,31 @@ class ProviderDeepSeekReverse(Provider):
                 return cls._strip_system_reminder(txt)
         return ""
 
+    @classmethod
+    def _split_browser_messages(cls, messages) -> tuple[list, str]:
+        """拆出（历史消息, 最新问题）。
+
+        最新问题 = 最后一条 user 消息；历史 = 它之前的全部消息。
+        不能简单用 messages[:-1]：带 tool_calls_result 时末尾是工具结果
+        而非最新提问，会导致最新问题被重复喂进历史。
+        """
+        idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                idx = i
+                break
+        if idx is None:
+            return [], ""
+        return messages[:idx], cls._last_user_text(messages)
+
     async def _browser_chat(self, messages, session_id=None) -> LLMResponse:
         from core import browser as browser_mod
-        # 完整历史（不含最后一条）+ 最新问题：首次喂历史，之后只发最新问题
-        history_prompt = self._build_browser_prompt(messages[:-1] if len(messages) > 1 else [])
-        latest_prompt = self._last_user_text(messages)
+        # 完整历史（最新问题之前）+ 最新问题：首次喂历史，之后只发最新问题
+        history_msgs, latest_prompt = self._split_browser_messages(messages)
+        history_prompt = self._build_browser_prompt(history_msgs)
+        if not latest_prompt:
+            raise Exception("浏览器模式未取到最新用户消息（可能整条被系统模板过滤），请调整提问内容后重试")
         logger.info(f"[Browser] 浏览器模式对话开始 session={session_id}")
         tried = set()
         last_err = None
@@ -772,6 +804,8 @@ class ProviderDeepSeekReverse(Provider):
         **kwargs,
     ) -> LLMResponse:
         self._ensure_initialized()
+        if image_urls or audio_urls:
+            logger.warning("[DeepSeekReverse] 暂不支持图片/音频输入，相关内容已忽略")
         model = model or self.get_model()
         messages = self._build_messages(
             prompt, contexts, system_prompt, func_tool, tool_choice, tool_calls_result
@@ -787,8 +821,11 @@ class ProviderDeepSeekReverse(Provider):
 
         resp = LLMResponse("assistant")
 
-        # 检测 tool_calls
-        tool_calls_detected, text = self._parse_tool_calls_from_text(text)
+        # 仅在注册了工具（或处于工具结果续写轮）时才检测 tool_calls，
+        # 避免普通回复里恰好含 name 键的 JSON 示例被误判成工具调用
+        tool_calls_detected = None
+        if func_tool is not None or tool_calls_result:
+            tool_calls_detected, text = self._parse_tool_calls_from_text(text)
 
         resp.completion_text = text or ""
         if reasoning:
@@ -843,6 +880,7 @@ class ProviderDeepSeekReverse(Provider):
         q: _stdq.Queue = _stdq.Queue()
         all_text: list[str] = []
         all_reasoning: list[str] = []
+        stream_status = {"finished": True}
 
         def _stream_worker():
             acct = None
@@ -898,7 +936,9 @@ class ProviderDeepSeekReverse(Provider):
                     return
                 logger.info("[流式请求] completion 响应收到，开始消费 SSE 流")
 
-                success = _consume_sse_chunks(deepseek_resp, q)
+                ok = _consume_sse_chunks(deepseek_resp, q)
+                stream_status["finished"] = ok
+                success = ok
                 if success:
                     acct["hif_fail_count"] = 0
 
@@ -937,7 +977,16 @@ class ProviderDeepSeekReverse(Provider):
         final_resp = LLMResponse("assistant")
         final_text = "".join(all_text)
 
-        tool_calls_detected, final_text = self._parse_tool_calls_from_text(final_text)
+        if not stream_status["finished"]:
+            # 与非流式"SSE 流中断抛错"对齐：流式阶段内容已部分发出，
+            # 只能显式标注截断，不能假装完整
+            logger.warning("[流式请求] SSE 流未正常结束（未收到结束标记），输出可能不完整")
+            final_text += "\n\n> ⚠️ DeepSeek 流式响应中断，以上内容可能不完整。"
+
+        # 仅在注册了工具（或处于工具结果续写轮）时才检测 tool_calls
+        tool_calls_detected = None
+        if func_tool is not None or tool_calls_result:
+            tool_calls_detected, final_text = self._parse_tool_calls_from_text(final_text)
         final_resp.completion_text = final_text
         final_resp.reasoning_content = "".join(all_reasoning) or None
 
@@ -1001,6 +1050,16 @@ class Main(Star):
         ds_account.init_account_queue()
         self.logger.info(f"[插件初始化] 配置已加载至 ds_config.CONFIG: {len(accounts)} 个账号，账号池已初始化")
 
+        # 后台预热 token 计数器：tiktoken 缺失的环境里首次调用会同步加载
+        # 6MB+ 的 HF tokenizer，不能让这一步卡在事件循环里
+        from core.tokens import count_tokens as _warmup_count
+        threading.Thread(target=_warmup_count, args=("warmup",), daemon=True).start()
+
+        # 启动期账号健康检查（后台线程，不阻塞加载）：提前过滤不可用账号。
+        # 浏览器模式不走 API 链路，跳过以免产生多余的自动化请求
+        if not bool(config.get("avoid_ban", False)):
+            threading.Thread(target=ds_account.run_health_checks, daemon=True).start()
+
         # 自动注册 provider source 和 provider（如果不存在）
         self._auto_register_provider()
 
@@ -1047,7 +1106,10 @@ class Main(Star):
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                loop = asyncio.get_event_loop()
+                # 无运行中的事件循环时无法创建运行时任务（AstrBot 正常加载
+                # 插件时都在事件循环内，此处仅作防御）
+                self.logger.warning("[自动注册] 当前无运行中的事件循环，跳过运行时实例创建")
+                return
 
             # 已有的运行时实例 ID 集合
             existing_ids = set()
@@ -1143,3 +1205,11 @@ class Main(Star):
             self.logger.info(f"[自动注册] 清理了 {len(to_remove)} 个旧 Provider 实例")
         except Exception as e:
             self.logger.warning(f"[自动注册] 清理旧实例时出错: {e}")
+
+        # 插件卸载/重载时释放浏览器资源，否则 headless Chromium 会泄漏
+        try:
+            from core import browser as browser_mod
+            await browser_mod.close()
+            self.logger.info("[terminate] 浏览器资源已释放")
+        except Exception as e:
+            self.logger.warning(f"[terminate] 关闭浏览器失败: {e}")

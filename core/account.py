@@ -111,15 +111,12 @@ def login_deepseek_via_account(account):
     account["token"] = new_token
     config.save_config(config.CONFIG)
 
-    ensure_hif_tokens(account, force=True)
-
     # 登录成功后必须拿到 HIF 令牌，否则后续请求必然失败
-    if not account.get("hif_dliq") or not account.get("hif_leim"):
-        if not ensure_hif_tokens(account, force=True):
-            logger.error(f"[login_deepseek_via_account] 账号 {email or mobile} 登录成功但 HIF 令牌获取失败")
-            raise HTTPException(
-                status_code=500, detail="Account login succeeded but HIF token fetch failed"
-            )
+    if not ensure_hif_tokens(account, force=True):
+        logger.error(f"[login_deepseek_via_account] 账号 {email or mobile} 登录成功但 HIF 令牌获取失败")
+        raise HTTPException(
+            status_code=500, detail="Account login succeeded but HIF token fetch failed"
+        )
 
     return new_token
 
@@ -127,6 +124,25 @@ def login_deepseek_via_account(account):
 # ----------------------------------------------------------------------
 # HIF 令牌获取
 # ----------------------------------------------------------------------
+def _decode_chunked_body(body: bytes) -> bytes:
+    """手工 socket 请求拿到的 chunked 响应体解码；非法格式时原样返回。"""
+    out = []
+    i = 0
+    while i < len(body):
+        j = body.find(b"\r\n", i)
+        if j < 0:
+            break
+        try:
+            size = int(body[i:j].split(b";")[0], 16)
+        except ValueError:
+            return body
+        if size == 0:
+            break
+        out.append(body[j + 2 : j + 2 + size])
+        i = j + 2 + size + 2
+    return b"".join(out)
+
+
 def _fetch_hif_via_socket(url, token_name, account):
     """DNS 被污染时的兜底：手动 socket 连接备用 IP + 正确 SNI 拿 token。"""
     from urllib.parse import urlparse
@@ -154,10 +170,13 @@ def _fetch_hif_via_socket(url, token_name, account):
                     break
                 data += chunk
         head, _, body = data.partition(bytes([13,10,13,10]))
-        status = head.decode(errors="ignore").split(chr(13)+chr(10))[0]
+        head_text = head.decode(errors="ignore")
+        status = head_text.split(chr(13)+chr(10))[0]
         if "200" not in status:
             logger.warning(f"[fetch_hif_token] 兜底 {token_name} {status}")
             return None
+        if "transfer-encoding: chunked" in head_text.lower():
+            body = _decode_chunked_body(body)
         data_json = json.loads(body)
         value = data_json.get("data", {}).get("biz_data", {}).get("value")
         if value:

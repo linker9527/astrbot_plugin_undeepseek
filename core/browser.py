@@ -119,6 +119,9 @@ _context = None
 _page = None
 _current_account = None
 _lock = asyncio.Lock()
+# 对话全程锁：所有账号/会话共用一个页面，发送与等待回复必须串行，
+# 否则并发请求的消息会交错进同一聊天框、回复互相串会话
+_chat_lock = asyncio.Lock()
 # 强制重建标志：被顶会话/超时后置位，让下一次 _ensure_page 跳过复用、重新登录
 _force_rebuild = False
 
@@ -326,7 +329,9 @@ async def _wait_reply(page, timeout: int, base_count: int = 0):
                 stable = 0
         await page.wait_for_timeout(800)
     if last:
-        return last
+        # 有部分文本同样属于超时：必须上抛让上层标记重建并重试，
+        # 不能把半截答案静默当成功返回（截断内容用户不可知）
+        raise TimeoutError("wait timeout %ss, partial=%r" % (timeout, last[:80]))
     raise TimeoutError("wait timeout %ss" % timeout)
 
 
@@ -375,31 +380,33 @@ async def chat(
     会话后续：复用同一页面，只发最新消息（网页端自己记住历史），上下文连续、不反复新建。
     """
     global _force_rebuild
-    page = await _ensure_page(account, password)
+    # 单页面全局共享，整个"发历史→发问题→等回复"流程必须串行执行
+    async with _chat_lock:
+        page = await _ensure_page(account, password)
 
-    is_first = bool(session_id) and session_id not in _active_sessions
-    if is_first:
-        _active_sessions.add(session_id)
-        # 首次：先发历史作为上下文（不返回它的回复），再发最新问题
-        if history_prompt.strip():
-            logger.info(f"[Browser] 会话 {session_id} 首次，喂入历史 {len(history_prompt)} 字")
-            _base = await _send(page, history_prompt)
-            try:
-                await _wait_reply(page, 30, _base)
-            except TimeoutError:
-                pass
-        else:
-            logger.info(f"[Browser] 会话 {session_id} 首次，无历史，直接发问题")
+        is_first = bool(session_id) and session_id not in _active_sessions
+        if is_first:
+            _active_sessions.add(session_id)
+            # 首次：先发历史作为上下文（不返回它的回复），再发最新问题
+            if history_prompt.strip():
+                logger.info(f"[Browser] 会话 {session_id} 首次，喂入历史 {len(history_prompt)} 字")
+                _base = await _send(page, history_prompt)
+                try:
+                    await _wait_reply(page, 30, _base)
+                except TimeoutError:
+                    pass
+            else:
+                logger.info(f"[Browser] 会话 {session_id} 首次，无历史，直接发问题")
 
-    # 发最新问题并返回回复
-    base = await _send(page, latest_prompt)
-    try:
-        text = await _wait_reply(page, timeout, base)
-        return text
-    except TimeoutError:
-        # 会话被顶/超时：标记强制重建，让下次 _ensure_page 重新登录
-        _force_rebuild = True
-        raise
+        # 发最新问题并返回回复
+        base = await _send(page, latest_prompt)
+        try:
+            text = await _wait_reply(page, timeout, base)
+            return text
+        except TimeoutError:
+            # 会话被顶/超时：标记强制重建，让下次 _ensure_page 重新登录
+            _force_rebuild = True
+            raise
 
 
 async def close():
