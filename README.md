@@ -39,7 +39,7 @@
 
 ## 依赖安装
 
-插件依赖以下 Python 包，请确保 AstrBot 的 Python 环境已安装：
+插件已提供 `requirements.txt`，AstrBot 安装插件时会自动安装依赖。如需手动安装，请确保 AstrBot 的 Python 环境已安装以下包：
 
 ```bash
 pip install curl_cffi wasmtime transformers tiktoken
@@ -210,6 +210,7 @@ playwright install chromium
 ## 版本历史
 
 - **1.2.0**：修复工具调用误判（普通 JSON 回复被当成 tool call）、浏览器模式并发串扰与截断静默返回、JSON 修复破坏空对象、SSE 未知路径污染正文等 15 处问题，详见《修复报告.md》
+- **1.2.1**：新增 astrbot_version 版本要求声明（>=4.27）与 requirements.txt 依赖清单
 - **1.1.3**：更新浏览器模式现状说明：转发链路已通，暂未出现封号，上下文逻辑仍在完善
 - **1.1.2**：移除有争议的提示前缀（PROMPT_GUARD_PREFIX）、补充代码注释、配置开关标注推荐
 - 更早版本：基础直调 API 逆向功能

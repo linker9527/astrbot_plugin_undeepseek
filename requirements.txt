@@ -1,0 +1,5 @@
+curl_cffi>=0.7
+wasmtime
+transformers
+tiktoken
+playwright>=1.40
