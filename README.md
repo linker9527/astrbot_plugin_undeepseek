@@ -5,6 +5,8 @@
 > 本插件提供 **两种运行模式**：默认的「直调 API 模式」（轻量、快）与新增的「浏览器模式」（抗风控、稳定）。详见下文。
 >
 > **浏览器模式当前状态**：逻辑链路已打通，消息转发成功，实测暂未出现封号；上下文处理逻辑仍需继续完善。
+>
+> ⚠️ **浏览器模式仅限 Windows**：依赖 Windows 下的 Chrome/Chromium 与 Playwright 环境（含 UNC 路径修复补丁），Linux/macOS 未适配。直调 API 模式无此限制。
 
 **使用方法：打开插件 → 配置文件 → 选择对话模型 → 找到 `免费deepseek api key/xxxx`（可以使用所添加的 8 个模型）**
 
@@ -38,6 +40,8 @@
 ---
 
 ## 依赖安装
+
+> **推荐环境**：AstrBot **4.27 及以上**（`metadata.yaml` 已声明 `astrbot_version: ">=4.27"`）；经实测 AstrBot **4.16** 亦可正常运行（未完整测试，仅供参考）。
 
 插件已提供 `requirements.txt`，AstrBot 安装插件时会自动安装依赖。如需手动安装，请确保 AstrBot 的 Python 环境已安装以下包：
 
@@ -210,7 +214,7 @@ playwright install chromium
 ## 版本历史
 
 - **1.2.0**：修复工具调用误判（普通 JSON 回复被当成 tool call）、浏览器模式并发串扰与截断静默返回、JSON 修复破坏空对象、SSE 未知路径污染正文等 15 处问题，详见《修复报告.md》
-- **1.2.1**：新增 astrbot_version 版本要求声明（>=4.27）与 requirements.txt 依赖清单
+- **1.2.1**：新增 astrbot_version 版本要求声明（推荐 >=4.27，实测 4.16 可用）、requirements.txt 依赖清单、浏览器模式仅限 Windows 说明
 - **1.1.3**：更新浏览器模式现状说明：转发链路已通，暂未出现封号，上下文逻辑仍在完善
 - **1.1.2**：移除有争议的提示前缀（PROMPT_GUARD_PREFIX）、补充代码注释、配置开关标注推荐
 - 更早版本：基础直调 API 逆向功能
