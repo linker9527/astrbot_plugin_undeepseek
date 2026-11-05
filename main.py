@@ -730,7 +730,7 @@ class ProviderDeepSeekReverse(Provider):
         return messages[:idx], cls._last_user_text(messages)
 
     async def _browser_chat(self, messages, session_id=None) -> LLMResponse:
-        from core import browser as browser_mod
+        from .core import browser as browser_mod
         # 完整历史（最新问题之前）+ 最新问题：首次喂历史，之后只发最新问题
         history_msgs, latest_prompt = self._split_browser_messages(messages)
         history_prompt = self._build_browser_prompt(history_msgs)
@@ -1005,8 +1005,8 @@ class Main(Star):
         if not config:
             return
 
-        import core.config as ds_config
-        import core.account as ds_account
+        from .core import config as ds_config
+        from .core import account as ds_account
 
         # 读取配置
         account_str = str(config.get("account", "")).strip()
@@ -1046,7 +1046,7 @@ class Main(Star):
 
         # 后台预热 token 计数器：tiktoken 缺失的环境里首次调用会同步加载
         # 6MB+ 的 HF tokenizer，不能让这一步卡在事件循环里
-        from core.tokens import count_tokens as _warmup_count
+        from .core.tokens import count_tokens as _warmup_count
         threading.Thread(target=_warmup_count, args=("warmup",), daemon=True).start()
 
         # 启动期账号健康检查（后台线程，不阻塞加载）：提前过滤不可用账号。
@@ -1202,7 +1202,7 @@ class Main(Star):
 
         # 插件卸载/重载时释放浏览器资源，否则 headless Chromium 会泄漏
         try:
-            from core import browser as browser_mod
+            from .core import browser as browser_mod
             await browser_mod.close()
             self.logger.info("[terminate] 浏览器资源已释放")
         except Exception as e:
