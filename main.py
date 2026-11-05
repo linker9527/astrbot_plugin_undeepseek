@@ -772,6 +772,7 @@ class ProviderDeepSeekReverse(Provider):
 
         tried = set()
         last_err = None
+        login_fail: list[str] = []
         for attempt in range(6):
             acct_dict, acct, pwd = self._browser_credentials(tried)
             if not acct or not pwd:
@@ -792,6 +793,15 @@ class ProviderDeepSeekReverse(Provider):
                 return resp
             except browser_mod.AccountBannedError as e:
                 logger.warning(f"[Browser] 账号 {acct} 被禁言，自动换号重试: {e}")
+                continue
+            except browser_mod.LoginFailedError as e:
+                # 登录失败（密码错/需验证码/风控）：换下一个账号试，
+                # 但日志要写清原因，避免误以为是网络抖动
+                last_err = e
+                login_fail.append(f"{acct}: {e}")
+                logger.error(
+                    f"[Browser] 账号 {acct} 网页登录失败: {e}（将尝试其他账号）"
+                )
                 continue
             except Exception as e:
                 # 瞬时错误（网络抖动 / 页面闪退 / 驱动异常）：先换号重试
@@ -819,6 +829,15 @@ class ProviderDeepSeekReverse(Provider):
                 raise Exception(
                     "浏览器模式无法启动：未检测到可用的浏览器内核。"
                     "请发送命令 /undeepseek online 下载内核后重试。"
+                )
+            # 全部账号都是登录失败：明确告诉用户是登录态/密码问题
+            if login_fail and len(login_fail) >= len(tried):
+                detail = "；".join(login_fail[:3])
+                logger.error(f"[Browser] 所有账号登录失败: {detail}")
+                raise Exception(
+                    "浏览器模式无法登录 DeepSeek 网页端。"
+                    f"已尝试 {len(login_fail)} 个账号均失败（原因见日志）。"
+                    "常见原因：密码已变更、账号需验证码验证、或账号被风控。"
                 )
             raise Exception(f"浏览器模式对话失败（已重试多个账号）：{type(last_err).__name__}: {last_err}")
         raise Exception("浏览器模式所有账号均被禁言或不可用，请检查账号状态后重试")

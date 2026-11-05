@@ -308,6 +308,7 @@ set UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.e
 
 ## 版本历史
 
+- **1.4.4**：修复浏览器模式登录失败时干等 30 秒超时的问题——改为点击登录后轮询检测错误提示，实测 1 秒内即可捕获「密码错误或账户不存在」；同时避免把进页面就有的「登录信息已失效」误判成本次登录失败
 - **1.4.3**：浏览器模式失败时自动检测内核，缺失就在日志明确提示「发送 /undeepseek online 下载内核」，并提前终止无意义的重试
 - **1.4.2**：`/undeepseek online` 改为检测优先——系统已有 Chrome/Edge/Brave 时不再下载 192MB 内核；新增 `online force` 强制下载；`status` 区分显示「已有 / 未安装 / 当前在用哪个」
 - **1.4.1**：内核安装位置改到插件自己的数据目录 `data/plugin_data/<插件名>/online/`（不再写入用户主目录 `ms-playwright`，符合插件只写自身数据空间的规范）

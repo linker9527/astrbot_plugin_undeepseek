@@ -282,35 +282,109 @@ async def _is_logged_in(page) -> bool:
         return False
 
 
+# 登录失败 / 需要人工验证的提示语。
+# 注意：只检测「点击登录之后新出现」的提示——cookie 过期时页面本身就会显示
+# 「登录信息已失效」，若不加区分会一进页面就误判成登录失败。
+LOGIN_FAIL_HINTS = [
+    "密码错误",
+    "账号或密码",
+    "用户名或密码",
+    "登录失败",
+    "操作过于频繁",
+    "账号异常",
+    "账号不存在",
+    "请完成验证",
+    "请进行验证",
+]
+
+# 这些提示在登录页一进来就存在，不能作为「本次登录失败」的依据
+PRE_EXISTING_HINTS = ["登录信息已失效", "验证码登录"]
+
+
+class LoginFailedError(Exception):
+    """登录失败（密码错/需要验证码/风控等），换号或提示用户。"""
+
+
+async def _read_login_error(page) -> str:
+    """从登录页抓取**本次登录**产生的错误提示，抓不到返回空串。
+
+    只认 LOGIN_FAIL_HINTS 里的强特征提示（密码错误、频繁、需验证等）；
+    「登录信息已失效」这类进页面就有的文案不算，避免一进页面就误判。
+    """
+    try:
+        body = await page.locator("body").inner_text()
+    except Exception:  # noqa: BLE001
+        return ""
+    for hint in LOGIN_FAIL_HINTS:
+        if hint in body:
+            idx = body.find(hint)
+            return body[max(0, idx - 40): idx + 80].replace("\n", " ").strip()
+    return ""
+
+
 async def _do_login(page, account: str, password: str):
-    """密码登录：切到密码登录模式 -> 填账号/密码 -> 点登录。"""
+    """密码登录：切到密码登录模式 -> 填账号/密码 -> 点登录 -> 确认进入聊天页。
+
+    登录失败（密码错、需验证码、风控）会抛 LoginFailedError，
+    而不是傻等到 30 秒超时——后者在日志里看不出真实原因。
+    """
     logger.info("[Browser] 开始网页登录: %s", account)
-    # 1. 点击可见的"密码登录"入口（切换到 手机号/邮箱 + 密码 表单）
-    for i in range(await page.locator(SEL_PWD_LOGIN).count()):
-        el = page.locator(SEL_PWD_LOGIN).nth(i)
-        if await el.is_visible():
-            await el.click(timeout=8000)
-            break
-    await page.wait_for_timeout(1200)
 
-    # 2. 填账号 + 密码
-    await page.locator(SEL_ACCOUNT).first.fill(account)
-    await page.locator(SEL_PASSWORD).first.fill(password)
+    # 1. 若当前不在密码登录模式（全新浏览器默认是验证码登录），点入口切换
+    if await page.locator(SEL_PASSWORD).count() == 0:
+        for i in range(await page.locator(SEL_PWD_LOGIN).count()):
+            el = page.locator(SEL_PWD_LOGIN).nth(i)
+            try:
+                if await el.is_visible():
+                    await el.click(timeout=8000)
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        await page.wait_for_timeout(1200)
 
-    # 3. 点可见的"登录"按钮（exact，避免点到"验证码登录"）
+    # 2. 确认表单存在，否则说明页面结构变了或卡在别的状态
+    if await page.locator(SEL_PASSWORD).count() == 0:
+        err = await _read_login_error(page)
+        raise LoginFailedError(
+            f"登录页未出现密码输入框（页面提示: {err or '无'}），无法自动登录"
+        )
+
+    # 3. 填账号 + 密码
+    try:
+        await page.locator(SEL_ACCOUNT).first.fill(account, timeout=10000)
+        await page.locator(SEL_PASSWORD).first.fill(password, timeout=10000)
+    except Exception as e:  # noqa: BLE001
+        raise LoginFailedError(f"填写账号/密码失败: {type(e).__name__}: {e}") from e
+
+    # 4. 点可见的"登录"按钮（exact，避免点到"验证码登录"）
     login_btn = page.get_by_text(SEL_LOGIN_BTN, exact=True)
     clicked = False
     for i in range(await login_btn.count()):
-        if await login_btn.nth(i).is_visible():
-            await login_btn.nth(i).click(timeout=8000)
-            clicked = True
-            break
+        try:
+            if await login_btn.nth(i).is_visible():
+                await login_btn.nth(i).click(timeout=8000)
+                clicked = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
     if not clicked:
-        raise RuntimeError("[Browser] 未找到可见的登录按钮")
+        raise LoginFailedError("未找到可见的登录按钮")
 
-    # 4. 等进入聊天页（出现输入框）
-    await page.locator(SEL_CHAT_INPUT).first.wait_for(state="visible", timeout=30000)
-    logger.info("[Browser] 网页登录成功")
+    # 5. 等进入聊天页：轮询判断，同时检测是否出现**新增的**错误提示
+    #    最多等 20 秒；一旦看到明确的登录失败提示立即抛出，不空等到超时
+    for step in range(20):
+        if await _is_logged_in(page):
+            logger.info("[Browser] 网页登录成功")
+            return
+        err = await _read_login_error(page)
+        if err:
+            raise LoginFailedError(f"登录失败，页面提示: {err}")
+        await page.wait_for_timeout(1000)
+
+    err = await _read_login_error(page)
+    raise LoginFailedError(
+        f"登录后 20 秒内未进入聊天页（当前 URL: {page.url}，页面提示: {err or '无'}）"
+    )
 
 
 async def _ensure_page(account: str, password: str):
