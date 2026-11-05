@@ -1,7 +1,4 @@
 import json
-import logging
-
-logger = logging.getLogger(__name__)
 
 # 插件模式下，CONFIG 由 Provider.__init__ 外部注入，不读写文件
 CONFIG = {}

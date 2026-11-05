@@ -1,13 +1,13 @@
 import json
-import logging
 import re
 import time
+
+from astrbot.api import logger
 
 from . import constants, session as session_module
 from .account import choose_new_account, login_deepseek_via_account, release_account
 from .constants import get_account_identifier
 
-logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
 # 指数退避重试参数

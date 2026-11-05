@@ -8,18 +8,19 @@
 
 说明：
 - 使用 async API，可在异步 Provider 中直接 await。
-- 登录态会持久化到 storage_state.json，复用 cookie 减少反复登录，降低风控。
+- 登录态会持久化到 AstrBot 的 data/plugin_data/<插件名>/storage_state_*.json，
+  复用 cookie 减少反复登录，降低风控（该文件等价于账号凭据，勿外传）。
 - 选择器已按真实网页实测校准（2026-08-26）。
 """
 
 import re
 import asyncio
-import logging
 import os
+
+from astrbot.api import logger
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-logger = logging.getLogger("DeepSeekReverse.browser")
 
 # 浏览器可执行文件：自动探测 Playwright 安装的 Chromium，并允许通过
 # 环境变量 UNDEEPSEEK_CHROME 覆盖（不同机器路径不同）。
@@ -47,12 +48,73 @@ CHROME_EXE = _find_chrome()
 DEEPSEEK_URL = "https://chat.deepseek.com/"
 
 # 登录态按账号分文件持久化（避免换号时互相覆盖）
+PLUGIN_NAME = "astrbot_plugin_undeepseek"
+
+# 旧版存储位置（插件包根目录），仅用于一次性迁移
+_LEGACY_PLUGIN_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+)
+
+
+def _storage_dir() -> str:
+    """登录态目录：AstrBot 的 data/plugin_data/<插件名>。
+
+    留出回落分支便于脱离 AstrBot 单独调试：拿不到数据目录时退到
+    插件目录下的 data/，避免写入插件包内部（插件更新会覆盖，且不符合
+    插件数据与代码分离的约定）。
+    """
+    try:
+        from astrbot.api.star import StarTools
+
+        path = str(StarTools.get_data_dir(PLUGIN_NAME))
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception as e:  # noqa: BLE001
+        fallback = os.path.join(_LEGACY_PLUGIN_DIR, "data")
+        logger.warning("[Browser] 获取 plugin_data 目录失败(%s)，回落到 %s", e, fallback)
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+def _migrate_legacy_storage(target_dir: str) -> None:
+    """把旧版存在插件根目录的 storage_state*.json 迁到新目录（移动，不留副本）。"""
+    try:
+        names = [
+            n
+            for n in os.listdir(_LEGACY_PLUGIN_DIR)
+            if n.startswith("storage_state") and n.endswith(".json")
+        ]
+    except Exception:  # noqa: BLE001
+        return
+    import shutil
+
+    for name in names:
+        src = os.path.join(_LEGACY_PLUGIN_DIR, name)
+        dst = os.path.join(target_dir, name)
+        if os.path.exists(dst):
+            continue
+        try:
+            shutil.move(src, dst)
+            logger.info("[Browser] 登录态已迁移: %s -> %s", name, target_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Browser] 登录态迁移失败 %s: %s", name, e)
+
+
 def _storage_path(identifier: str) -> str:
     import hashlib
+
     safe = hashlib.md5(identifier.encode("utf-8")).hexdigest()[:12]
-    return os.path.normpath(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", f"storage_state_{safe}.json")
-    )
+    target_dir = _storage_dir()
+    _migrate_legacy_storage(target_dir)
+    return os.path.join(target_dir, f"storage_state_{safe}.json")
+
+
+def _restrict_permissions(path: str) -> None:
+    """登录态等价于账号凭据，POSIX 上收紧到仅本人可读写。"""
+    try:
+        os.chmod(path, 0o600)
+    except Exception:  # noqa: BLE001
+        pass
 
 # ---------------------------------------------------------------------------
 # 修复 Playwright 在 Windows 长路径(\\?\E:\)下驱动无法启动的问题：
@@ -240,6 +302,7 @@ async def _ensure_page(account: str, password: str):
             await _do_login(_page, account, password)
             try:
                 await _context.storage_state(path=state_path)
+                _restrict_permissions(state_path)
                 logger.info("[Browser] 登录态已保存到 %s", state_path)
             except Exception as _e:  # noqa: BLE001
                 logger.warning("[Browser] 保存登录态失败: %s", _e)

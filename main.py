@@ -11,20 +11,13 @@ AstrBot Provider 插件 —— DeepSeek 逆向 API
 
 import asyncio
 import json
-import logging
-import os
-import sys
 import threading
 import time
 
 from collections.abc import AsyncGenerator
 from typing import Any, Literal
 
-# 确保插件目录在 sys.path 中，使 core 包可被导入
-_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-if _PLUGIN_DIR not in sys.path:
-    sys.path.insert(0, _PLUGIN_DIR)
-
+from astrbot.api import logger
 from astrbot.api.provider import Provider
 from astrbot.api.star import Star
 from astrbot.core.provider.register import (
@@ -42,12 +35,13 @@ import astrbot.core.message.components as Comp
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.agent.tool import ToolSet
 
-# 导入 deepseek2api-neo 核心模块
-from core import account, chat, config, constants, session as session_module
-from core.pow import get_pow_response
-from core.tokens import count_tokens
-
-logger = logging.getLogger("deepseek_reverse")
+# 导入 deepseek2api-neo 核心模块。
+# 必须用包内相对导入：绝对导入 `from core import ...` 会把模块注册成顶层
+# `core.*`，AstrBot 重载插件时只清理 `data.plugins.<插件>.*`，旧模块残留
+# 会导致重载后仍执行旧代码（且与其它插件的同名包冲突）。
+from .core import account, chat, config, constants, session as session_module
+from .core.pow import get_pow_response
+from .core.tokens import count_tokens
 
 SUPPORTED_MODELS = [
     "deepseek-v4-flash",

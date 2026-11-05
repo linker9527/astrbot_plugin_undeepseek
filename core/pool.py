@@ -2,11 +2,11 @@
 线程安全的账号池 —— 最空闲优先调度 + RAII Guard。
 """
 
-import logging
+from astrbot.api import logger
+
 import threading
 import time
 
-logger = logging.getLogger(__name__)
 
 
 class AccountPool:

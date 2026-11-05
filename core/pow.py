@@ -1,9 +1,10 @@
 import base64
 import ctypes
 import json
-import logging
 import struct
 import time
+
+from astrbot.api import logger
 
 from wasmtime import Linker, Module, Store
 
@@ -11,7 +12,6 @@ from . import constants, session as session_module
 from .account import choose_new_account, login_deepseek_via_account, release_account
 from .constants import get_account_identifier
 
-logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -45,7 +45,9 @@ def compute_pow_answer(
         with open(wasm_path, "rb") as f:
             wasm_bytes = f.read()
     except Exception as e:
-        raise RuntimeError(f"加载 wasm 文件失败: {wasm_path}, 错误: {e}")
+        raise RuntimeError(
+            f"PoW 计算文件缺失，插件包不完整（sha3_wasm_bg.*.wasm），请重新安装插件: {wasm_path} ({e})"
+        )
     module = Module(store.engine, wasm_bytes)
     instance = linker.instantiate(store, module)
     exports = instance.exports(store)

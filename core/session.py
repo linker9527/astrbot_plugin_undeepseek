@@ -1,10 +1,10 @@
-import logging
+
+from astrbot.api import logger
 
 from curl_cffi import requests
 
 from . import constants
 
-logger = logging.getLogger(__name__)
 
 _token_session = None  # token 模式下的全局 session
 

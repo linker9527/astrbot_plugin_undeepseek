@@ -3,9 +3,7 @@
 最终回退到 char/4 估算。
 """
 
-import logging
-
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 _tokenizer = None
 

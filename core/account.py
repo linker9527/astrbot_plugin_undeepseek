@@ -1,9 +1,10 @@
 import json
-import logging
 import random
 import socket
 import ssl
 import time
+
+from astrbot.api import logger
 
 from curl_cffi import requests
 from fastapi import HTTPException, Request
@@ -11,7 +12,6 @@ from fastapi import HTTPException, Request
 from . import config, constants, session as session_module
 from .pool import account_pool
 
-logger = logging.getLogger(__name__)
 
 # HIF token 刷新间隔（秒）
 HIF_TOKEN_TTL = 4 * 3600

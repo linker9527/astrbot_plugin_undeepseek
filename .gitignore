@@ -15,7 +15,6 @@ __pycache__/
 Thumbs.db
 # 浏览器登录态（含 cookie/token，禁止提交）
 storage_state*.json
-*.wasm
 
 # 本地报告
 浏览器模式bug修复报告.md
