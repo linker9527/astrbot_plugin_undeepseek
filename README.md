@@ -62,6 +62,15 @@ pip install curl_cffi wasmtime transformers tiktoken
 插件会自动从 Playwright 官方 CDN 下载完整 Chromium（约 192 MB），并解压安装到
 `~/AppData/Local/ms-playwright/chromium-<revision>/`。安装完成后立即生效，无需重启。
 
+**发送命令后机器人会先回一条开始提示**，告诉你进度去哪看：
+
+```
+开始下载浏览器内核（Chrome for Testing 151.0.7922.34，约 192MB）。
+下载进度请查看 AstrBot 日志，每 10 秒输出一条：
+  百分比 / 已下载与总量 / 速度 / 剩余时间
+下载完成后会在这里收到第二条消息。
+```
+
 下载过程中每 **10 秒**向 AstrBot 日志写入一条进度：
 
 ```
@@ -71,11 +80,13 @@ pip install curl_cffi wasmtime transformers tiktoken
 [浏览器内核] 安装成功: ...\chromium-1234\chrome-win64\chrome.exe
 ```
 
+下载完成后机器人再回一条完成消息。若内核已安装，则只回一条「无需重复下载」。
+
 相关命令：
 
 | 命令 | 说明 |
 |---|---|
-| `/undeepseek online` | 下载并安装浏览器内核 |
+| `/undeepseek online` | 下载并安装浏览器内核（先回开始提示，进度看日志，完成后回结果） |
 | `/undeepseek status` | 查看内核安装状态与当前使用的浏览器路径 |
 
 > **下载加速说明**：单个连接实测被限速到 15-330 KB/s，插件默认使用 **8 线程分片下载**

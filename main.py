@@ -1188,7 +1188,8 @@ class Main(Star):
         sub = (sub or "").strip().lower()
 
         if sub in ("online", "install", "download"):
-            yield event.plain_result(await self._cmd_download_kernel())
+            async for r in self._cmd_download_kernel(event):
+                yield r
             return
 
         if sub in ("status", "info", ""):
@@ -1222,22 +1223,45 @@ class Main(Star):
             lines.append("  → 发送 /undeepseek online 下载内核")
         return "\n".join(lines)
 
-    async def _cmd_download_kernel(self) -> str:
+    async def _cmd_download_kernel(self, event):
+        """下载内核：先立即回一条开工提示，下载完再回结果。
+
+        下载可能持续数分钟，若等下载完才回复，聊天窗口会长时间静默。
+        """
         from .core import setup as setup_mod
         from .core import browser as browser_mod
 
         # 防止重复触发
         if getattr(self, "_kernel_downloading", False):
-            return "内核正在下载中，请稍候（进度见 AstrBot 日志，每 10 秒一条）。"
+            yield event.plain_result("内核正在下载中，请稍候（进度见 AstrBot 日志，每 10 秒一条）。")
+            return
+
+        if setup_mod.is_chromium_installed():
+            self.logger.info("[浏览器内核] 已安装，跳过下载")
+            browser_mod.refresh_chrome_exe()
+            yield event.plain_result(
+                f"浏览器内核已安装，无需重复下载。\n路径: {setup_mod.chromium_exe_path()}"
+            )
+            return
+
+        rev = setup_mod.chromium_revision()
+        version = setup_mod.chromium_version()
+
+        # 先回一条，让用户知道命令收到了
+        yield event.plain_result(
+            f"开始下载浏览器内核（Chrome for Testing {version}，约 192MB）。\n"
+            f"下载进度请查看 AstrBot 日志，每 10 秒输出一条：\n"
+            f"  百分比 / 已下载与总量 / 速度 / 剩余时间\n"
+            f"下载完成后会在这里收到第二条消息。"
+        )
+
         self._kernel_downloading = True
         try:
-            if setup_mod.is_chromium_installed():
-                self.logger.info("[浏览器内核] 已安装，跳过下载")
-                browser_mod.refresh_chrome_exe()
-                return f"浏览器内核已安装，无需重复下载。\n路径: {setup_mod.chromium_exe_path()}"
-
-            rev = setup_mod.chromium_revision()
-            self.logger.info("[浏览器内核] 开始下载 Chromium (revision=%s)，进度每 10 秒写入日志", rev)
+            self.logger.info(
+                "[浏览器内核] 开始下载 Chromium (revision=%s, version=%s)，进度每 10 秒写入日志",
+                rev,
+                version,
+            )
 
             # 下载是阻塞操作，放线程里避免卡住事件循环
             result = await asyncio.to_thread(setup_mod.download_chromium, rev)
@@ -1246,11 +1270,15 @@ class Main(Star):
                 # 让新内核立即生效，无需重载插件
                 path = browser_mod.refresh_chrome_exe()
                 self.logger.info("[浏览器内核] 已生效: %s", path)
-                return f"✅ 浏览器内核下载完成\n路径: {result.get('path') or path}"
-            return f"❌ {result.get('message')}"
+                yield event.plain_result(
+                    f"✅ 浏览器内核下载完成\n路径: {result.get('path') or path}\n"
+                    f"浏览器模式现在可以直接使用，无需重启插件。"
+                )
+            else:
+                yield event.plain_result(f"❌ {result.get('message')}")
         except Exception as e:
             self.logger.error("[浏览器内核] 下载异常: %s: %s", type(e).__name__, e, exc_info=True)
-            return f"❌ 内核下载失败: {type(e).__name__}: {e}"
+            yield event.plain_result(f"❌ 内核下载失败: {type(e).__name__}: {e}")
         finally:
             self._kernel_downloading = False
 
