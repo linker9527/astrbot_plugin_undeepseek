@@ -11,6 +11,7 @@ AstrBot Provider 插件 —— DeepSeek 逆向 API
 
 import asyncio
 import json
+import os
 import threading
 import time
 
@@ -18,6 +19,7 @@ from collections.abc import AsyncGenerator
 from typing import Any, Literal
 
 from astrbot.api import logger
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import Provider
 from astrbot.api.star import Star
 from astrbot.core.provider.register import (
@@ -1175,8 +1177,84 @@ class Main(Star):
         except Exception as e:
             self.logger.error(f"[自动注册] 整体流程异常: {type(e).__name__}: {e}", exc_info=True)
 
+    # -- 命令 -----------------------------------------------------------
+    @filter.command("undeepseek")
+    async def undeepseek_cmd(self, event: AstrMessageEvent, sub: str = ""):
+        """浏览器内核管理命令。
+
+        /undeepseek online  —— 下载并安装浏览器内核（Chromium）
+        /undeepseek status  —— 查看当前内核状态
+        """
+        sub = (sub or "").strip().lower()
+
+        if sub in ("online", "install", "download"):
+            yield event.plain_result(await self._cmd_download_kernel())
+            return
+
+        if sub in ("status", "info", ""):
+            yield event.plain_result(self._cmd_kernel_status())
+            return
+
+        yield event.plain_result(
+            "用法：\n"
+            "  /undeepseek online  —— 下载并安装浏览器内核\n"
+            "  /undeepseek status  —— 查看内核状态"
+        )
+
+    def _cmd_kernel_status(self) -> str:
+        from .core import setup as setup_mod
+        from .core import browser as browser_mod
+
+        rev = setup_mod.chromium_revision()
+        exe = setup_mod.chromium_exe_path(rev)
+        installed = os.path.isfile(exe)
+        resolved = browser_mod.refresh_chrome_exe()
+
+        lines = [
+            "【浏览器内核状态】",
+            f"  版本 revision: {rev}",
+            f"  内置内核: {'已安装' if installed else '未安装'}",
+        ]
+        if installed:
+            lines.append(f"  路径: {exe}")
+        lines.append(f"  当前使用: {resolved or '未找到任何可用浏览器'}")
+        if not resolved:
+            lines.append("  → 发送 /undeepseek online 下载内核")
+        return "\n".join(lines)
+
+    async def _cmd_download_kernel(self) -> str:
+        from .core import setup as setup_mod
+        from .core import browser as browser_mod
+
+        # 防止重复触发
+        if getattr(self, "_kernel_downloading", False):
+            return "内核正在下载中，请稍候（进度见 AstrBot 日志，每 10 秒一条）。"
+        self._kernel_downloading = True
+        try:
+            if setup_mod.is_chromium_installed():
+                self.logger.info("[浏览器内核] 已安装，跳过下载")
+                browser_mod.refresh_chrome_exe()
+                return f"浏览器内核已安装，无需重复下载。\n路径: {setup_mod.chromium_exe_path()}"
+
+            rev = setup_mod.chromium_revision()
+            self.logger.info("[浏览器内核] 开始下载 Chromium (revision=%s)，进度每 10 秒写入日志", rev)
+
+            # 下载是阻塞操作，放线程里避免卡住事件循环
+            result = await asyncio.to_thread(setup_mod.download_chromium, rev)
+
+            if result.get("ok"):
+                # 让新内核立即生效，无需重载插件
+                path = browser_mod.refresh_chrome_exe()
+                self.logger.info("[浏览器内核] 已生效: %s", path)
+                return f"✅ 浏览器内核下载完成\n路径: {result.get('path') or path}"
+            return f"❌ {result.get('message')}"
+        except Exception as e:
+            self.logger.error("[浏览器内核] 下载异常: %s: %s", type(e).__name__, e, exc_info=True)
+            return f"❌ 内核下载失败: {type(e).__name__}: {e}"
+        finally:
+            self._kernel_downloading = False
+
     async def terminate(self):
-        """插件重载时清理旧的 Provider 实例，确保下次加载使用新代码"""
         try:
             pm = self.context.provider_manager
             to_remove = []

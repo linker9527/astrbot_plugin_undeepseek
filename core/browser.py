@@ -42,10 +42,29 @@ def _find_chrome() -> str:
         matches = sorted(_glob.glob(pat))
         if matches:
             return matches[0]
+    # 3) 回退到系统已安装的 Chrome / Edge（无需额外下载内核即可跑浏览器模式）
+    system_candidates = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Microsoft", "Edge", "Application", "msedge.exe"),
+    ]
+    for path in system_candidates:
+        if path and os.path.isfile(path):
+            logger.info("[Browser] 未找到 Playwright 内核，改用系统浏览器: %s", path)
+            return path
     return ""
 
 CHROME_EXE = _find_chrome()
 DEEPSEEK_URL = "https://chat.deepseek.com/"
+
+
+def refresh_chrome_exe() -> str:
+    """重新探测浏览器路径（下载内核后调用，使新内核立即生效）。"""
+    global CHROME_EXE
+    CHROME_EXE = _find_chrome()
+    return CHROME_EXE
 
 # 登录态按账号分文件持久化（避免换号时互相覆盖）
 PLUGIN_NAME = "astrbot_plugin_undeepseek"
@@ -257,6 +276,17 @@ async def _ensure_page(account: str, password: str):
             _page = None
 
         if _browser is None or not _browser.is_connected():
+            # 浏览器内核路径在每次启动前重新探测：可能刚通过
+            # /undeepseek online 下载完，也可能是用户中途装了系统 Chrome
+            exe_path = refresh_chrome_exe()
+            if not exe_path:
+                raise RuntimeError(
+                    "未找到可用的浏览器内核。请任选一种方式：\n"
+                    "  1) 发送命令 /undeepseek online 自动下载（推荐）\n"
+                    "  2) 执行 playwright install chromium\n"
+                    "  3) 设置环境变量 UNDEEPSEEK_CHROME 指向 chrome.exe / msedge.exe"
+                )
+
             # Playwright 子进程会继承带 \\?\ 前缀的 PATH（AstrBot 嵌入 E 盘所致），
             # node 遇到该 UNC 前缀会报 EISDIR 启动失败。这里给子进程一份干净的
             # PATH（把 \\?\E:\ 还原成 E:\），并在重启前记录一条日志便于排查。
@@ -273,7 +303,7 @@ async def _ensure_page(account: str, password: str):
                 _launch_env = None
             _pw = await async_playwright().start()
             _browser = await _pw.chromium.launch(
-                executable_path=CHROME_EXE,
+                executable_path=exe_path,
                 headless=True,
                 env=_launch_env,
                 # 隐藏 Playwright 自动化痕迹（如 navigator.webdriver），

@@ -49,14 +49,55 @@
 pip install curl_cffi wasmtime transformers tiktoken
 ```
 
-**使用浏览器模式还需要安装 Playwright 与 Chromium 浏览器：**
+**使用浏览器模式还需要 Chromium 内核，任选一种方式安装：**
+
+**方式一：插件内一键下载（推荐）**
+
+在聊天窗口发送：
+
+```
+/undeepseek online
+```
+
+插件会自动从 Playwright 官方 CDN 下载完整 Chromium（约 192 MB），并解压安装到
+`~/AppData/Local/ms-playwright/chromium-<revision>/`。安装完成后立即生效，无需重启。
+
+下载过程中每 **10 秒**向 AstrBot 日志写入一条进度：
+
+```
+[浏览器内核] 下载中 45.3% (86.9 MB / 191.8 MB) 速度 1.1 MB/s 剩余约 1m36s
+[浏览器内核] 下载完成 100% (191.8 MB / 191.8 MB) 平均速度 515.3 KB/s 耗时 6m21s
+[浏览器内核] 正在解压到 ...\ms-playwright\chromium-1234 ...
+[浏览器内核] 安装成功: ...\chromium-1234\chrome-win64\chrome.exe
+```
+
+相关命令：
+
+| 命令 | 说明 |
+|---|---|
+| `/undeepseek online` | 下载并安装浏览器内核 |
+| `/undeepseek status` | 查看内核安装状态与当前使用的浏览器路径 |
+
+> **下载加速说明**：单个连接实测被限速到 15-330 KB/s，插件默认使用 **8 线程分片下载**
+> （HTTP Range），实测可达 500 KB/s-1.1 MB/s。若服务器不支持 Range 会自动回退单线程。
+
+**方式二：使用 Playwright 官方安装**
 
 ```bash
 pip install playwright
 playwright install chromium
 ```
 
-> 浏览器模式会优先使用系统已安装的完整 Chromium（通过 `executable_path` 指定），避免 Playwright 默认只下载 headless-shell 的问题。
+**方式三：使用系统已装的 Chrome / Edge（无需下载）**
+
+插件在找不到 Playwright 内核时，会自动探测系统 Chrome 与 Edge。也可手动指定：
+
+```bash
+set UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+```
+
+> 三种方式的优先级：`UNDEEPSEEK_CHROME` 环境变量 > Playwright 内核 > 系统 Chrome/Edge。
+> 均未找到时，浏览器模式会给出明确提示，不再抛出 `spawn . ENOENT` 这类难以理解的错误。
 
 ---
 
@@ -205,14 +246,19 @@ playwright install chromium
 - 本地 DNS 可能解析不了 DeepSeek 的 HIF 域名
 - 插件已内置 **DNS 兜底**，会自动改用备用 IP 直连，一般无需手动处理
 
-### Q5：Playwright 相关报错（node/UNC 路径 / headless-shell）
-- 插件已内置两个修复：去除 `\\?\E:\` UNC 路径前缀、用 `executable_path` 指向完整 Chromium
-- 确保已执行 `playwright install chromium`
+### Q5：Playwright 相关报错（node/UNC 路径 / headless-shell / spawn . ENOENT）
+- 插件已内置修复：去除 `\\?\E:\` UNC 路径前缀、用 `executable_path` 指向完整 Chromium
+- **`BrowserType.launch: Failed to launch: Error: spawn . ENOENT`**：表示找不到浏览器内核。
+  发送 `/undeepseek online` 一键下载即可（约 192 MB，进度见日志）
+- 若下载太慢，可改用系统已有的 Edge：设置环境变量
+  `UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+- 排查当前状态：发送 `/undeepseek status` 查看内核路径与是否安装
 
 ---
 
 ## 版本历史
 
+- **1.4.0**：新增 `/undeepseek online` 一键下载浏览器内核（8 线程分片加速、每 10 秒写进度日志）、`/undeepseek status` 查看状态；找不到内核时自动回退系统 Chrome/Edge；修复 `spawn . ENOENT` 报错
 - **1.3.0**：上架审核整改：日志改用 `astrbot.api.logger`；`core` 改为包内相对导入（修复插件重载后仍执行旧代码）；浏览器登录态迁移到 `data/plugin_data/`；wasm 计算文件随包发布；版本声明对齐，详见《审核整改说明.md》
 - **1.2.2**：版本要求调整为 astrbot_version>=4.16（实测 4.16 接口齐全可用，推荐 4.27+）
 - **1.2.1**：新增 astrbot_version 版本要求声明（推荐 >=4.27，实测 4.16 可用）、requirements.txt 依赖清单、浏览器模式仅限 Windows 说明
