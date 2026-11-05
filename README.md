@@ -308,6 +308,7 @@ set UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.e
 
 ## 版本历史
 
+- **1.4.3**：浏览器模式失败时自动检测内核，缺失就在日志明确提示「发送 /undeepseek online 下载内核」，并提前终止无意义的重试
 - **1.4.2**：`/undeepseek online` 改为检测优先——系统已有 Chrome/Edge/Brave 时不再下载 192MB 内核；新增 `online force` 强制下载；`status` 区分显示「已有 / 未安装 / 当前在用哪个」
 - **1.4.1**：内核安装位置改到插件自己的数据目录 `data/plugin_data/<插件名>/online/`（不再写入用户主目录 `ms-playwright`，符合插件只写自身数据空间的规范）
 - **1.4.0**：新增 `/undeepseek online` 一键下载浏览器内核（8 线程分片加速、每 10 秒写进度日志）、`/undeepseek status` 查看状态；找不到内核时自动回退系统 Chrome/Edge；修复 `spawn . ENOENT` 报错

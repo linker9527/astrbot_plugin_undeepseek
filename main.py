@@ -731,6 +731,33 @@ class ProviderDeepSeekReverse(Provider):
             return [], ""
         return messages[:idx], cls._last_user_text(messages)
 
+    @staticmethod
+    def _diagnose_browser_kernel() -> str | None:
+        """检查浏览器内核可用性。不可用则返回提示文案（同时写日志），可用返回 None。
+
+        只在「没有可用浏览器」时告警，避免正常使用时刷日志。
+        """
+        try:
+            from .core import browser as browser_mod
+            from .core import setup as setup_mod
+
+            path, source, source_name = browser_mod.detect_browser()
+            if source != browser_mod.SRC_NONE and path:
+                return None
+
+            rev = setup_mod.chromium_revision()
+            msg = (
+                "[Browser] 未检测到可用的浏览器内核，浏览器模式无法启动。"
+                f"（内置内核路径: {setup_mod.chromium_exe_path(rev)}）"
+                " 请发送命令 /undeepseek online 下载内核；"
+                "或安装 Chrome/Edge，或设置环境变量 UNDEEPSEEK_CHROME 指向浏览器可执行文件。"
+            )
+            logger.error(msg)
+            return msg
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Browser] 内核可用性检测本身出错: {type(e).__name__}: {e}")
+            return None
+
     async def _browser_chat(self, messages, session_id=None) -> LLMResponse:
         from .core import browser as browser_mod
         # 完整历史（最新问题之前）+ 最新问题：首次喂历史，之后只发最新问题
@@ -739,6 +766,10 @@ class ProviderDeepSeekReverse(Provider):
         if not latest_prompt:
             raise Exception("浏览器模式未取到最新用户消息（可能整条被系统模板过滤），请调整提问内容后重试")
         logger.info(f"[Browser] 浏览器模式对话开始 session={session_id}")
+
+        # 每次调用前先确认内核可用；缺失时日志里明确提示需要用哪个命令
+        self._diagnose_browser_kernel()
+
         tried = set()
         last_err = None
         for attempt in range(6):
@@ -765,6 +796,14 @@ class ProviderDeepSeekReverse(Provider):
             except Exception as e:
                 # 瞬时错误（网络抖动 / 页面闪退 / 驱动异常）：先换号重试
                 last_err = e
+                # 若是内核缺失导致，日志里给出明确指引（不必等 6 次重试都失败）
+                hint = self._diagnose_browser_kernel()
+                if hint:
+                    logger.warning(
+                        f"[Browser] 账号 {acct} 启动浏览器失败({type(e).__name__})，"
+                        f"且确认没有可用内核，停止重试"
+                    )
+                    break
                 logger.warning(
                     f"[Browser] 账号 {acct} 瞬时错误({type(e).__name__})，换号重试第 {attempt+1} 次: {e}"
                 )
@@ -775,6 +814,12 @@ class ProviderDeepSeekReverse(Provider):
                 if acct_dict is not None:
                     account.release_account(acct_dict)
         if last_err is not None:
+            # 失败收尾时再判定一次：属于内核缺失就给用户可执行的指引
+            if self._diagnose_browser_kernel():
+                raise Exception(
+                    "浏览器模式无法启动：未检测到可用的浏览器内核。"
+                    "请发送命令 /undeepseek online 下载内核后重试。"
+                )
             raise Exception(f"浏览器模式对话失败（已重试多个账号）：{type(last_err).__name__}: {last_err}")
         raise Exception("浏览器模式所有账号均被禁言或不可用，请检查账号状态后重试")
 
