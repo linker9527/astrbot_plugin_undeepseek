@@ -22,8 +22,8 @@ from astrbot.api import logger
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 
-# 浏览器可执行文件：自动探测 Playwright 安装的 Chromium，并允许通过
-# 环境变量 UNDEEPSEEK_CHROME 覆盖（不同机器路径不同）。
+# 浏览器可执行文件：自动探测可用浏览器，并允许通过环境变量
+# UNDEEPSEEK_CHROME 覆盖（不同机器路径不同）。
 # Playwright 自带 node 有 UNC 长路径 bug，故优先手动下载解压的完整 chrome。
 import glob as _glob
 
@@ -32,47 +32,89 @@ _LEGACY_PLUGIN_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 )
 
+# 探测来源标记
+SRC_ENV = "env"                    # 环境变量指定
+SRC_PLUGIN = "plugin"              # 插件内 online 下载的内核
+SRC_PLAYWRIGHT = "playwright"      # 系统 playwright install 装的
+SRC_SYSTEM = "system"              # 系统已装的 Chrome / Edge / Brave
+SRC_NONE = "none"                  # 都没找到
 
-def _find_chrome() -> str:
-    # 1) 环境变量显式指定
+
+def _system_browser_candidates() -> list[tuple[str, str]]:
+    """系统已安装的 Chromium 系浏览器，返回 [(名称, 路径)]。
+
+    只列 Chromium 内核的浏览器：Firefox 走 Playwright 的 firefox 通道，
+    不能用 chromium.launch 启动，故不纳入。
+    """
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local = os.environ.get("LOCALAPPDATA", "")
+    candidates = [
+        ("Chrome", os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe")),
+        ("Chrome", os.path.join(pf86, "Google", "Chrome", "Application", "chrome.exe")),
+        ("Chrome", os.path.join(local, "Google", "Chrome", "Application", "chrome.exe")),
+        ("Edge", os.path.join(pf86, "Microsoft", "Edge", "Application", "msedge.exe")),
+        ("Edge", os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe")),
+        ("Brave", os.path.join(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")),
+        ("Chromium", os.path.join(pf, "Chromium", "Application", "chrome.exe")),
+    ]
+    seen = set()
+    result = []
+    for name, path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        real = os.path.normcase(os.path.realpath(path))
+        if real in seen:
+            continue
+        seen.add(real)
+        result.append((name, path))
+    return result
+
+
+def detect_browser() -> tuple[str, str, str]:
+    """探测可用浏览器，返回 (路径, 来源标记, 人类可读名称)。
+
+    优先级（前面的更可控，后面的更省事）：
+      1. UNDEEPSEEK_CHROME 环境变量 —— 用户显式指定
+      2. 插件内 online 内核 —— /undeepseek online 下载的
+      3. 系统 Playwright 目录 —— 用户自己 playwright install chromium
+      4. 系统 Chrome / Edge / Brave —— 无需下载即可用
+    """
+    # 1) 环境变量
     env = os.environ.get("UNDEEPSEEK_CHROME", "").strip()
-    if env and os.path.exists(env):
-        return env
+    if env and os.path.isfile(env):
+        return env, SRC_ENV, f"环境变量指定 ({os.path.basename(env)})"
 
-    # 2) 插件自己的内核目录（/undeepseek online 下载到这里）
+    # 2) 插件自己的内核目录
     try:
-        plugin_online = os.path.join(
-            _plugin_online_dir(), "chromium-*", "chrome-win64", "chrome.exe"
+        matches = sorted(
+            _glob.glob(os.path.join(_plugin_online_dir(), "chromium-*", "chrome-win64", "chrome.exe"))
         )
-        matches = sorted(_glob.glob(plugin_online))
         if matches:
-            return matches[0]
+            return matches[0], SRC_PLUGIN, "插件内置内核 (online 下载)"
     except Exception as _e:  # noqa: BLE001
         logger.debug("[Browser] 插件内核目录探测失败: %s", _e)
 
-    # 3) 系统级 Playwright 安装目录（用户用 playwright install chromium 装的）
-    patterns = [
+    # 3) 系统级 Playwright 安装目录
+    for pat in (
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright", "chromium-*", "chrome-win64", "chrome.exe"),
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright", "chromium-*", "chrome-win", "chrome.exe"),
         os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright", "chromium-*", "chrome-linux", "chrome"),
-    ]
-    for pat in patterns:
+    ):
         matches = sorted(_glob.glob(pat))
         if matches:
-            return matches[0]
-    # 4) 回退到系统已安装的 Chrome / Edge（无需额外下载内核即可跑浏览器模式）
-    system_candidates = [
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Google", "Chrome", "Application", "chrome.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Google", "Chrome", "Application", "chrome.exe"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft", "Edge", "Application", "msedge.exe"),
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Microsoft", "Edge", "Application", "msedge.exe"),
-    ]
-    for path in system_candidates:
-        if path and os.path.isfile(path):
-            logger.info("[Browser] 未找到插件内核，改用系统浏览器: %s", path)
-            return path
-    return ""
+            return matches[0], SRC_PLAYWRIGHT, "系统 Playwright 内核"
+
+    # 4) 系统已装浏览器
+    for name, path in _system_browser_candidates():
+        logger.info("[Browser] 未找到内置内核，使用系统浏览器: %s (%s)", name, path)
+        return path, SRC_SYSTEM, f"系统 {name}"
+
+    return "", SRC_NONE, "未找到"
+
+
+def _find_chrome() -> str:
+    return detect_browser()[0]
 
 
 def _plugin_online_dir() -> str:

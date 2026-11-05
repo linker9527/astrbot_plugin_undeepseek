@@ -93,8 +93,36 @@ AstrBot 分配给自己的 `plugin_data` 空间。
 
 | 命令 | 说明 |
 |---|---|
-| `/undeepseek online` | 下载并安装浏览器内核（先回开始提示，进度看日志，完成后回结果） |
-| `/undeepseek status` | 查看内核安装状态与当前使用的浏览器路径 |
+| `/undeepseek online` | **检测优先**：已有可用浏览器（系统 Chrome/Edge/Brave 或内置内核）时不下载；都没有才下载 |
+| `/undeepseek online force` | 强制下载插件内置内核（即使系统已有浏览器） |
+| `/undeepseek status` | 查看内核是「已有」还是「未安装」，以及当前实际在用哪个浏览器 |
+
+`/undeepseek status` 输出示例（内置内核已安装）：
+
+```
+【浏览器内核状态】
+  内置内核: 已有
+    版本: Chrome for Testing 151.0.7922.34 (revision 1234)
+    路径: ...\plugin_data\astrbot_plugin_undeepseek\online\chromium-1234\chrome-win64\chrome.exe
+  当前使用: 插件内置内核 (online 下载) (【已有】)
+  系统浏览器:
+    - Chrome: C:\Users\ning\AppData\Local\Google\Chrome\Application\chrome.exe
+    - Edge: C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+```
+
+内置内核未安装但系统有浏览器时：
+
+```
+【浏览器内核状态】
+  内置内核: 未安装
+  当前使用: 系统 Chrome (可直接使用，无需下载内核)
+    路径: C:\Users\ning\AppData\Local\Google\Chrome\Application\chrome.exe
+  系统浏览器:
+    - Chrome: ...
+    - Edge: ...
+  说明: 当前用系统/环境变量指定的浏览器运行，无需下载内核
+       如需插件自管内核，可发送 /undeepseek online
+```
 
 > **下载加速说明**：单个连接实测被限速到 15-330 KB/s，插件默认使用 **8 线程分片下载**
 > （HTTP Range），实测可达 500 KB/s-1.1 MB/s。若服务器不支持 Range 会自动回退单线程。
@@ -114,8 +142,12 @@ playwright install chromium
 set UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
 ```
 
-> 内核探测优先级：`UNDEEPSEEK_CHROME` 环境变量 > **插件内 online 内核** > 系统 Playwright 目录 > 系统 Chrome/Edge。
+> 内核探测优先级：`UNDEEPSEEK_CHROME` 环境变量 > **插件内 online 内核** > 系统 Playwright 目录 > 系统 Chrome/Edge/Brave。
+> 也就是说：**系统里已经有 Chrome 或 Edge 时，完全不需要下载内核，浏览器模式可以直接用**。
 > 均未找到时，浏览器模式会给出明确提示，不再抛出 `spawn . ENOENT` 这类难以理解的错误。
+>
+> 支持的系统浏览器：Chrome、Edge、Brave、Chromium（均为 Chromium 内核）。
+> Firefox 不支持（Playwright 需走独立通道，不能用 `chromium.launch` 启动）。
 
 ---
 
@@ -276,6 +308,7 @@ set UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.e
 
 ## 版本历史
 
+- **1.4.2**：`/undeepseek online` 改为检测优先——系统已有 Chrome/Edge/Brave 时不再下载 192MB 内核；新增 `online force` 强制下载；`status` 区分显示「已有 / 未安装 / 当前在用哪个」
 - **1.4.1**：内核安装位置改到插件自己的数据目录 `data/plugin_data/<插件名>/online/`（不再写入用户主目录 `ms-playwright`，符合插件只写自身数据空间的规范）
 - **1.4.0**：新增 `/undeepseek online` 一键下载浏览器内核（8 线程分片加速、每 10 秒写进度日志）、`/undeepseek status` 查看状态；找不到内核时自动回退系统 Chrome/Edge；修复 `spawn . ENOENT` 报错
 - **1.3.0**：上架审核整改：日志改用 `astrbot.api.logger`；`core` 改为包内相对导入（修复插件重载后仍执行旧代码）；浏览器登录态迁移到 `data/plugin_data/`；wasm 计算文件随包发布；版本声明对齐，详见《审核整改说明.md》

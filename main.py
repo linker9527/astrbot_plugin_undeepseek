@@ -1184,11 +1184,19 @@ class Main(Star):
 
         /undeepseek online  —— 下载并安装浏览器内核（Chromium）
         /undeepseek status  —— 查看当前内核状态
+        /undeepseek online force —— 强制重新下载内置内核
         """
         sub = (sub or "").strip().lower()
 
         if sub in ("online", "install", "download"):
-            async for r in self._cmd_download_kernel(event):
+            # 默认：先检测，已有可用浏览器就不下载
+            async for r in self._cmd_ensure_kernel(event, force=False):
+                yield r
+            return
+
+        if sub in ("online force", "force", "install force", "download force"):
+            # 强制下载内置内核（忽略已有浏览器）
+            async for r in self._cmd_ensure_kernel(event, force=True):
                 yield r
             return
 
@@ -1198,8 +1206,9 @@ class Main(Star):
 
         yield event.plain_result(
             "用法：\n"
-            "  /undeepseek online  —— 下载并安装浏览器内核\n"
-            "  /undeepseek status  —— 查看内核状态"
+            "  /undeepseek online        —— 检测浏览器，缺失才下载内核\n"
+            "  /undeepseek online force  —— 强制重新下载内置内核\n"
+            "  /undeepseek status        —— 查看内核状态"
         )
 
     def _cmd_kernel_status(self) -> str:
@@ -1207,26 +1216,52 @@ class Main(Star):
         from .core import browser as browser_mod
 
         rev = setup_mod.chromium_revision()
+        version = setup_mod.chromium_version()
         exe = setup_mod.chromium_exe_path(rev)
         installed = os.path.isfile(exe)
-        resolved = browser_mod.refresh_chrome_exe()
+        path, source, source_name = browser_mod.detect_browser()
 
-        lines = [
-            "【浏览器内核状态】",
-            f"  版本 revision: {rev}",
-            f"  内置内核: {'已安装' if installed else '未安装'}",
-        ]
+        lines = ["【浏览器内核状态】"]
+
+        # 内置内核
         if installed:
-            lines.append(f"  路径: {exe}")
-        lines.append(f"  当前使用: {resolved or '未找到任何可用浏览器'}")
-        if not resolved:
+            lines.append(f"  内置内核: 已有")
+            lines.append(f"    版本: Chrome for Testing {version} (revision {rev})")
+            lines.append(f"    路径: {exe}")
+        else:
+            lines.append("  内置内核: 未安装")
+
+        # 当前实际使用的浏览器
+        if source == browser_mod.SRC_PLUGIN:
+            lines.append(f"  当前使用: {source_name} (【已有】)")
+        elif source == browser_mod.SRC_NONE:
+            lines.append("  当前使用: 无")
+        else:
+            lines.append(f"  当前使用: {source_name} (可直接使用，无需下载内核)")
+        if path and source != browser_mod.SRC_NONE:
+            lines.append(f"    路径: {path}")
+
+        # 系统浏览器清单，方便确认到底检测到了什么
+        systems = browser_mod._system_browser_candidates()
+        if systems:
+            lines.append("  系统浏览器:")
+            for name, p in systems:
+                lines.append(f"    - {name}: {p}")
+
+        # 引导：只有真正没有可用浏览器时才提示下载
+        if source == browser_mod.SRC_NONE:
             lines.append("  → 发送 /undeepseek online 下载内核")
+        elif not installed:
+            lines.append("  说明: 当前用系统/环境变量指定的浏览器运行，无需下载内核")
+            lines.append("       如需插件自管内核，可发送 /undeepseek online")
+
         return "\n".join(lines)
 
-    async def _cmd_download_kernel(self, event):
-        """下载内核：先立即回一条开工提示，下载完再回结果。
+    async def _cmd_ensure_kernel(self, event, force: bool = False):
+        """检测并确保有可用浏览器；缺失才下载内核。
 
-        下载可能持续数分钟，若等下载完才回复，聊天窗口会长时间静默。
+        force=True 时忽略已有的系统浏览器，强制下载插件内置内核。
+        下载可能持续数分钟，故先回提示再下载，避免聊天窗口长时间静默。
         """
         from .core import setup as setup_mod
         from .core import browser as browser_mod
@@ -1236,23 +1271,50 @@ class Main(Star):
             yield event.plain_result("内核正在下载中，请稍候（进度见 AstrBot 日志，每 10 秒一条）。")
             return
 
-        if setup_mod.is_chromium_installed():
-            self.logger.info("[浏览器内核] 已安装，跳过下载")
-            browser_mod.refresh_chrome_exe()
-            yield event.plain_result(
-                f"浏览器内核已安装，无需重复下载。\n路径: {setup_mod.chromium_exe_path()}"
-            )
-            return
-
         rev = setup_mod.chromium_revision()
         version = setup_mod.chromium_version()
 
-        # 先回一条，让用户知道命令收到了
+        # 1) 插件内置内核已存在
+        if setup_mod.is_chromium_installed() and not force:
+            self.logger.info("[浏览器内核] 内置内核已存在，跳过下载")
+            browser_mod.refresh_chrome_exe()
+            yield event.plain_result(
+                f"浏览器内核【已有】，无需下载。\n"
+                f"版本: Chrome for Testing {version} (revision {rev})\n"
+                f"路径: {setup_mod.chromium_exe_path()}"
+            )
+            return
+
+        # 2) 检测系统里是否已有可用浏览器
+        path, source, source_name = browser_mod.detect_browser()
+        has_usable = source != browser_mod.SRC_NONE and not force
+
+        if has_usable:
+            # 已有可用浏览器：不下载，直接告知可用
+            browser_mod.refresh_chrome_exe()
+            self.logger.info(
+                "[浏览器内核] 检测到可用浏览器(%s): %s，无需下载内核", source, path
+            )
+            yield event.plain_result(
+                f"已检测到可用浏览器，【无需下载内核】。\n"
+                f"  来源: {source_name}\n"
+                f"  路径: {path}\n"
+                f"浏览器模式可以直接使用。\n"
+                f"如需插件自管内核，发送 /undeepseek online force 强制下载。"
+            )
+            return
+
+        # 3) 确实没有可用浏览器（或用户要求强制下载）→ 开始下载
+        if force and source != browser_mod.SRC_NONE:
+            yield event.plain_result(
+                f"收到强制下载请求（当前已有可用浏览器: {source_name}）。"
+            )
+
         yield event.plain_result(
             f"开始下载浏览器内核（Chrome for Testing {version}，约 192MB）。\n"
             f"下载进度请查看 AstrBot 日志，每 10 秒输出一条：\n"
             f"  百分比 / 已下载与总量 / 速度 / 剩余时间\n"
-            f"下载完成后会在这里收到第二条消息。"
+            f"下载完成后会在这里收到结果。"
         )
 
         self._kernel_downloading = True
@@ -1268,10 +1330,10 @@ class Main(Star):
 
             if result.get("ok"):
                 # 让新内核立即生效，无需重载插件
-                path = browser_mod.refresh_chrome_exe()
-                self.logger.info("[浏览器内核] 已生效: %s", path)
+                new_path = browser_mod.refresh_chrome_exe()
+                self.logger.info("[浏览器内核] 已生效: %s", new_path)
                 yield event.plain_result(
-                    f"✅ 浏览器内核下载完成\n路径: {result.get('path') or path}\n"
+                    f"✅ 浏览器内核下载完成\n路径: {result.get('path') or new_path}\n"
                     f"浏览器模式现在可以直接使用，无需重启插件。"
                 )
             else:
