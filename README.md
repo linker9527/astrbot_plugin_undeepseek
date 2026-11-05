@@ -60,7 +60,14 @@ pip install curl_cffi wasmtime transformers tiktoken
 ```
 
 插件会自动从 Playwright 官方 CDN 下载完整 Chromium（约 192 MB），并解压安装到
-`~/AppData/Local/ms-playwright/chromium-<revision>/`。安装完成后立即生效，无需重启。
+**插件自己的数据目录**：
+
+```
+data/plugin_data/astrbot_plugin_undeepseek/online/chromium-<revision>/chrome-win64/chrome.exe
+```
+
+安装完成后立即生效，无需重启。内核不写入系统目录或用户主目录，插件只使用
+AstrBot 分配给自己的 `plugin_data` 空间。
 
 **发送命令后机器人会先回一条开始提示**，告诉你进度去哪看：
 
@@ -76,8 +83,8 @@ pip install curl_cffi wasmtime transformers tiktoken
 ```
 [浏览器内核] 下载中 45.3% (86.9 MB / 191.8 MB) 速度 1.1 MB/s 剩余约 1m36s
 [浏览器内核] 下载完成 100% (191.8 MB / 191.8 MB) 平均速度 515.3 KB/s 耗时 6m21s
-[浏览器内核] 正在解压到 ...\ms-playwright\chromium-1234 ...
-[浏览器内核] 安装成功: ...\chromium-1234\chrome-win64\chrome.exe
+[浏览器内核] 正在解压到 ...\plugin_data\astrbot_plugin_undeepseek\online\chromium-1234 ...
+[浏览器内核] 安装成功: ...\online\chromium-1234\chrome-win64\chrome.exe
 ```
 
 下载完成后机器人再回一条完成消息。若内核已安装，则只回一条「无需重复下载」。
@@ -107,7 +114,7 @@ playwright install chromium
 set UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
 ```
 
-> 三种方式的优先级：`UNDEEPSEEK_CHROME` 环境变量 > Playwright 内核 > 系统 Chrome/Edge。
+> 内核探测优先级：`UNDEEPSEEK_CHROME` 环境变量 > **插件内 online 内核** > 系统 Playwright 目录 > 系统 Chrome/Edge。
 > 均未找到时，浏览器模式会给出明确提示，不再抛出 `spawn . ENOENT` 这类难以理解的错误。
 
 ---
@@ -269,6 +276,7 @@ set UNDEEPSEEK_CHROME=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.e
 
 ## 版本历史
 
+- **1.4.1**：内核安装位置改到插件自己的数据目录 `data/plugin_data/<插件名>/online/`（不再写入用户主目录 `ms-playwright`，符合插件只写自身数据空间的规范）
 - **1.4.0**：新增 `/undeepseek online` 一键下载浏览器内核（8 线程分片加速、每 10 秒写进度日志）、`/undeepseek status` 查看状态；找不到内核时自动回退系统 Chrome/Edge；修复 `spawn . ENOENT` 报错
 - **1.3.0**：上架审核整改：日志改用 `astrbot.api.logger`；`core` 改为包内相对导入（修复插件重载后仍执行旧代码）；浏览器登录态迁移到 `data/plugin_data/`；wasm 计算文件随包发布；版本声明对齐，详见《审核整改说明.md》
 - **1.2.2**：版本要求调整为 astrbot_version>=4.16（实测 4.16 接口齐全可用，推荐 4.27+）

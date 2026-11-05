@@ -5,7 +5,10 @@
 本模块负责：
   - 从 Playwright 官方 CDN 下载 chrome-win64.zip
   - 流式写入并每 10 秒写一次进度日志（已下载/总量、百分比、速度）
-  - 解压到 ms-playwright/chromium-<revision>/ 并校验 chrome.exe
+  - 解压到插件自己的数据目录 data/plugin_data/<插件名>/online/ 并校验 chrome.exe
+
+内核刻意装进插件数据目录（而不是用户主目录下的 ms-playwright）：
+插件只应写 AstrBot 分配给自己的 plugin_data 空间，避免污染系统路径。
 
 不做断点续传：失败即整体重试，逻辑保持简单。
 """
@@ -17,6 +20,8 @@ import time
 import zipfile
 
 from astrbot.api import logger
+
+PLUGIN_NAME = "astrbot_plugin_undeepseek"
 
 # Playwright 官方 CDN（主源 + 微软 ESRP 备用源）
 # 注意：URL 路径里用的是 Chrome for Testing 的 browserVersion（如 151.0.7922.34），
@@ -38,12 +43,29 @@ DEFAULT_CHROMIUM_VERSION = "151.0.7922.34"
 CHUNK_SIZE = 256 * 1024
 
 
-def ms_playwright_dir() -> str:
-    """Playwright 的浏览器安装根目录（与 playwright 自身保持一致）。"""
-    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
-    if env and env != "0":
-        return env
-    return os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright")
+def online_dir() -> str:
+    """内核安装根目录：data/plugin_data/<插件名>/online。
+
+    优先用 AstrBot 官方 API 取插件数据目录；脱离 AstrBot 单独调试时
+    回落到插件目录下的 data/plugin_data/<插件名>/online（同样在插件包内，
+    不写到系统路径）。
+    """
+    try:
+        from astrbot.api.star import StarTools
+
+        base = str(StarTools.get_data_dir(PLUGIN_NAME))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[Setup] 获取 plugin_data 目录失败，用插件内回退路径: %s", e)
+        base = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data",
+            "plugin_data",
+            PLUGIN_NAME,
+        )
+
+    path = os.path.join(base, "online")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def chromium_info() -> tuple[str, str]:
@@ -81,11 +103,12 @@ def chromium_version() -> str:
 
 
 def chromium_exe_path(revision: str | None = None) -> str:
-    """推算解压后 chrome.exe 的绝对路径。"""
+    """推算解压后 chrome.exe 的绝对路径。
+
+    结构：<plugin_data>/online/chromium-<revision>/chrome-win64/chrome.exe
+    """
     rev = revision or chromium_revision()
-    return os.path.join(
-        ms_playwright_dir(), f"chromium-{rev}", "chrome-win64", "chrome.exe"
-    )
+    return os.path.join(online_dir(), f"chromium-{rev}", "chrome-win64", "chrome.exe")
 
 
 def is_chromium_installed(revision: str | None = None) -> bool:

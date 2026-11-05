@@ -27,12 +27,30 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 # Playwright 自带 node 有 UNC 长路径 bug，故优先手动下载解压的完整 chrome。
 import glob as _glob
 
+# 插件包根目录（core/ 的上一级），提前定义供各辅助函数使用
+_LEGACY_PLUGIN_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+)
+
+
 def _find_chrome() -> str:
     # 1) 环境变量显式指定
     env = os.environ.get("UNDEEPSEEK_CHROME", "").strip()
     if env and os.path.exists(env):
         return env
-    # 2) 常见 Playwright chromium 安装目录下探测 chrome.exe
+
+    # 2) 插件自己的内核目录（/undeepseek online 下载到这里）
+    try:
+        plugin_online = os.path.join(
+            _plugin_online_dir(), "chromium-*", "chrome-win64", "chrome.exe"
+        )
+        matches = sorted(_glob.glob(plugin_online))
+        if matches:
+            return matches[0]
+    except Exception as _e:  # noqa: BLE001
+        logger.debug("[Browser] 插件内核目录探测失败: %s", _e)
+
+    # 3) 系统级 Playwright 安装目录（用户用 playwright install chromium 装的）
     patterns = [
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright", "chromium-*", "chrome-win64", "chrome.exe"),
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright", "chromium-*", "chrome-win", "chrome.exe"),
@@ -42,7 +60,7 @@ def _find_chrome() -> str:
         matches = sorted(_glob.glob(pat))
         if matches:
             return matches[0]
-    # 3) 回退到系统已安装的 Chrome / Edge（无需额外下载内核即可跑浏览器模式）
+    # 4) 回退到系统已安装的 Chrome / Edge（无需额外下载内核即可跑浏览器模式）
     system_candidates = [
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Google", "Chrome", "Application", "chrome.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Google", "Chrome", "Application", "chrome.exe"),
@@ -52,9 +70,20 @@ def _find_chrome() -> str:
     ]
     for path in system_candidates:
         if path and os.path.isfile(path):
-            logger.info("[Browser] 未找到 Playwright 内核，改用系统浏览器: %s", path)
+            logger.info("[Browser] 未找到插件内核，改用系统浏览器: %s", path)
             return path
     return ""
+
+
+def _plugin_online_dir() -> str:
+    """插件内核目录（与 core/setup.py 的 online_dir 保持一致）。"""
+    try:
+        from astrbot.api.star import StarTools
+
+        base = str(StarTools.get_data_dir("astrbot_plugin_undeepseek"))
+    except Exception:  # noqa: BLE001
+        base = os.path.join(_LEGACY_PLUGIN_DIR, "data", "plugin_data", "astrbot_plugin_undeepseek")
+    return os.path.join(base, "online")
 
 CHROME_EXE = _find_chrome()
 DEEPSEEK_URL = "https://chat.deepseek.com/"
@@ -68,11 +97,6 @@ def refresh_chrome_exe() -> str:
 
 # 登录态按账号分文件持久化（避免换号时互相覆盖）
 PLUGIN_NAME = "astrbot_plugin_undeepseek"
-
-# 旧版存储位置（插件包根目录），仅用于一次性迁移
-_LEGACY_PLUGIN_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-)
 
 
 def _storage_dir() -> str:
