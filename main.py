@@ -622,8 +622,22 @@ class ProviderDeepSeekReverse(Provider):
                      f"account={repr(config.CONFIG.get('account',''))[:40]}, "
                      f"accounts={len(config.CONFIG.get('accounts',[]))}, "
                      f"avoid_ban={config.CONFIG.get('avoid_ban')}")
+
+        # 启动期探测判定为「需人工登录」的账号直接跳过，不浪费一次失败请求
         try:
-            acct = account.choose_new_account(exclude_ids or [])
+            from .core import pending_login
+
+            pending = {x["account"] for x in pending_login.list_pending()}
+        except Exception:  # noqa: BLE001
+            pending = set()
+        skip = set(exclude_ids or []) | pending
+        if pending:
+            logger.info(
+                "[Browser] 跳过待人工登录账号: %s", ", ".join(sorted(pending))
+            )
+
+        try:
+            acct = account.choose_new_account(skip)
             if acct:
                 identifier = acct.get("email") or acct.get("mobile") or ""
                 pwd = acct.get("password", "")
@@ -637,6 +651,13 @@ class ProviderDeepSeekReverse(Provider):
             logger.warning(f"[Browser] 从账号池取号失败，回退单值: {e}")
         acct_str = str(config.CONFIG.get("account", "") or "").strip()
         pwd = str(config.CONFIG.get("password", "") or "").strip()
+        if acct_str and acct_str in pending:
+            logger.warning(
+                "[Browser] 无可用账号：%s 需先在此电脑人工登录一次"
+                "（发送 /undeepseek status 或查看配置页待登录清单）",
+                acct_str,
+            )
+            return None, "", ""
         return None, acct_str, pwd  # 回退单值时无 guard
 
     @staticmethod
@@ -776,6 +797,18 @@ class ProviderDeepSeekReverse(Provider):
         for attempt in range(6):
             acct_dict, acct, pwd = self._browser_credentials(tried)
             if not acct or not pwd:
+                try:
+                    from .core import pending_login
+
+                    pend = pending_login.list_pending()
+                except Exception:  # noqa: BLE001
+                    pend = []
+                if pend:
+                    names = ", ".join(x["account"] for x in pend)
+                    raise Exception(
+                        f"浏览器模式无可用账号：{names} 需先在此电脑的浏览器里"
+                        "人工登录一次（完成邮箱验证/人机验证），登录后会自动恢复。"
+                    )
                 raise Exception("浏览器模式无可用账号（未配置 DeepSeek 账号）")
             if acct in tried:
                 # 该账号已试过：释放它再继续尝试下一个
@@ -1134,6 +1167,16 @@ class Main(Star):
         # 浏览器模式不走 API 链路，跳过以免产生多余的自动化请求
         if not bool(config.get("avoid_ban", False)):
             threading.Thread(target=ds_account.run_health_checks, daemon=True).start()
+        else:
+            # 浏览器模式：重载时主动探测每个账号能否登录，把需要人工验证的
+            # 账号提前标记，之后浏览器模式直接跳过它们（不必等用户发消息失败）
+            from .core import account_probe
+
+            threading.Thread(
+                target=account_probe.probe_all_accounts,
+                args=(accounts,),
+                daemon=True,
+            ).start()
 
         # 自动注册 provider source 和 provider（如果不存在）
         self._auto_register_provider()
