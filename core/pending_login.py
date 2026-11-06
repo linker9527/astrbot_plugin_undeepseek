@@ -65,10 +65,28 @@ def _state_path() -> str:
 
 
 def _load() -> dict:
+    """读取状态文件，并归一化 accounts 为 dict。
+
+    公开清单用的是数组格式，若有人误把公开清单复制成状态文件（或旧版残留），
+    accounts 会是 list，直接当 dict 用会抛
+    TypeError: list indices must be integers or slices, not str。
+    """
     try:
         with open(_state_path(), encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
+            acc = data.get("accounts")
+            if isinstance(acc, list):
+                # 数组里可能是字符串或 {"account": "..."}，统一转成 dict
+                data["accounts"] = {
+                    (x if isinstance(x, str) else (x or {}).get("account", "")): (
+                        {} if isinstance(x, str) else x
+                    )
+                    for x in acc
+                    if x
+                }
+            elif not isinstance(acc, dict):
+                data["accounts"] = {}
             return data
     except Exception:  # noqa: BLE001
         pass
