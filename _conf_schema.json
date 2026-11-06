@@ -1,1 +1,48 @@
-{"account": {"type": "string", "description": "账号", "hint": "邮箱或电话号码，自动识别（11位纯数字=电话，否则=邮箱）", "default": ""}, "password": {"type": "string", "description": "密码", "hint": "DeepSeek 网页端登录密码", "default": ""}, "extra_accounts": {"type": "list", "description": "额外账号", "hint": "需要多个账号时点添加。格式：账号:密码（自动识别电话/邮箱）", "items": {"type": "string"}, "default": []}, "avoid_ban": {"type": "bool", "description": "*推荐*避免封控（浏览器模式）", "hint": "使用真实浏览器访问 DeepSeek 网页端，抗风控能力最强；副作用：无法使用 agent/工具调用。开启后切换即可生效。", "default": false}}
+{
+  "account": {
+    "type": "string",
+    "description": "账号",
+    "hint": "邮箱或电话号码，自动识别（11位纯数字=电话，否则=邮箱）",
+    "default": ""
+  },
+  "password": {
+    "type": "string",
+    "description": "密码",
+    "hint": "DeepSeek 网页端登录密码",
+    "default": ""
+  },
+  "extra_accounts": {
+    "type": "list",
+    "description": "额外账号",
+    "hint": "需要多个账号时点添加。格式：账号:密码（自动识别电话/邮箱）",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "avoid_ban": {
+    "type": "bool",
+    "description": "*推荐*避免封控（浏览器模式）",
+    "hint": "使用真实浏览器访问 DeepSeek 网页端，抗风控能力最强；副作用：无法使用 agent/工具调用。开启后切换即可生效。",
+    "default": false
+  },
+  "login_hint": {
+    "type": "string",
+    "description": "⚠️ 需要预先登录的账号",
+    "hint": "首次使用的账号需先在此电脑的任意浏览器里完成一次 DeepSeek 网页登录（可能要求邮箱验证码/人机验证，插件无法自动完成）。登录过一次后本列表会自动清空。完成后点重载/保存，刷新列表。详细清单见插件配置页。",
+    "default": "",
+    "readonly": true,
+    "condition": {
+      "avoid_ban": true
+    }
+  },
+  "show_login_password": {
+    "type": "bool",
+    "description": "在待登录列表中显示明文密码",
+    "hint": "关闭后列表只显示账号。若插件需要复审，建议关闭此项（避免凭据在 WebUI 上展示）。",
+    "default": true,
+    "condition": {
+      "avoid_ban": true
+    }
+  }
+}

@@ -794,6 +794,21 @@ class ProviderDeepSeekReverse(Provider):
             except browser_mod.AccountBannedError as e:
                 logger.warning(f"[Browser] 账号 {acct} 被禁言，自动换号重试: {e}")
                 continue
+            except browser_mod.ManualLoginRequiredError as e:
+                # 需要人工验证：记录到待登录清单并写明确日志，换下一个账号
+                last_err = e
+                try:
+                    from .core import pending_login
+
+                    pending_login.mark_needs_login(acct, pwd, str(e))
+                except Exception as pe:  # noqa: BLE001
+                    logger.warning(f"[Browser] 记录待登录状态失败: {pe}")
+                logger.error(
+                    f"[Browser] 账号 {acct} 需要先在此电脑的任意浏览器进行一次登录"
+                    f"（页面提示: {e}）。插件无法自动完成邮箱验证/人机验证，"
+                    f"请在配置页【待登录账号】清单里查看。"
+                )
+                continue
             except browser_mod.LoginFailedError as e:
                 # 登录失败（密码错/需验证码/风控）：换下一个账号试，
                 # 但日志要写清原因，避免误以为是网络抖动

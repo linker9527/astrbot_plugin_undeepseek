@@ -305,6 +305,10 @@ class LoginFailedError(Exception):
     """登录失败（密码错/需要验证码/风控等），换号或提示用户。"""
 
 
+class ManualLoginRequiredError(Exception):
+    """账号需要在本机浏览器人工完成一次登录（邮箱验证码/人机验证）。"""
+
+
 async def _read_login_error(page) -> str:
     """从登录页抓取**本次登录**产生的错误提示，抓不到返回空串。
 
@@ -375,7 +379,28 @@ async def _do_login(page, account: str, password: str):
     for step in range(20):
         if await _is_logged_in(page):
             logger.info("[Browser] 网页登录成功")
+            # 登录成功即清除该账号的「待人工登录」标记
+            try:
+                from . import pending_login
+
+                pending_login.mark_logged_in(account)
+            except Exception:  # noqa: BLE001
+                pass
             return
+
+        # 优先识别「需要人工验证」——这类不是密码问题，换号也没用
+        try:
+            from . import pending_login
+
+            body = await page.locator("body").inner_text()
+            hint = pending_login.detect_manual_login_hint(body)
+            if hint:
+                raise ManualLoginRequiredError(hint)
+        except ManualLoginRequiredError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+
         err = await _read_login_error(page)
         if err:
             raise LoginFailedError(f"登录失败，页面提示: {err}")
