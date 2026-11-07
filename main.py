@@ -98,6 +98,30 @@ def _is_lock_thinking(model: str) -> bool:
 
 
 # ----------------------------------------------------------------------#
+#  SSE 流解析（安全提取 fragments）
+# ----------------------------------------------------------------------#
+def _iter_fragments(value):
+    """从 fragment 容器里安全提取 (类型, 内容) 对。
+
+    v.response / v 的结构可能随服务端变化，任何一步类型不符都直接跳过该 chunk，
+    不能让单个畸形 chunk 抛异常把整条流的已收正文全部作废。
+    """
+    if isinstance(value, dict):
+        frags = value.get("fragments", [])
+    else:
+        frags = value
+    if not isinstance(frags, (list, tuple)):
+        return
+    for fr in frags:
+        if not isinstance(fr, dict):
+            continue
+        ft = fr.get("type", "")
+        fc = fr.get("content", "")
+        if isinstance(fc, str) and fc:
+            yield ("thinking" if ft == "THINK" else "text"), fc
+
+
+# ----------------------------------------------------------------------#
 #  SSE 流解析（非流式版 —— 收集完整文本后返回）
 # ----------------------------------------------------------------------#
 def _consume_sse_full(resp) -> tuple[str, str, bool]:
@@ -126,26 +150,20 @@ def _consume_sse_full(resp) -> tuple[str, str, bool]:
 
             # 新格式 A：response.fragments
             if "v" in chunk and isinstance(chunk["v"], dict) and "response" in chunk["v"]:
-                frags = chunk["v"]["response"].get("fragments", [])
-                if frags:
-                    for fr in frags:
-                        ft = fr.get("type", "")
-                        cp = "thinking" if ft == "THINK" else "text"
-                        fc = fr.get("content", "")
-                        if fc:
-                            (think_parts if cp == "thinking" else text_parts).append(fc)
+                try:
+                    for cp, fc in _iter_fragments(chunk["v"].get("response")):
+                        (think_parts if cp == "thinking" else text_parts).append(fc)
+                except Exception as e:
+                    logger.debug(f"[sse_full] 跳过畸形 fragments chunk: {e}")
                 continue
 
             # 新格式 B：APPEND fragments
             if chunk.get("p") == "response/fragments" and chunk.get("o") == "APPEND":
-                new_frags = chunk.get("v", [])
-                if new_frags:
-                    for fr in new_frags:
-                        ft = fr.get("type", "")
-                        cp = "thinking" if ft == "THINK" else "text"
-                        fc = fr.get("content", "")
-                        if fc:
-                            (think_parts if cp == "thinking" else text_parts).append(fc)
+                try:
+                    for cp, fc in _iter_fragments(chunk.get("v")):
+                        (think_parts if cp == "thinking" else text_parts).append(fc)
+                except Exception as e:
+                    logger.debug(f"[sse_full] 跳过畸形 APPEND chunk: {e}")
                 continue
 
             # 旧格式：路径标记
@@ -189,6 +207,21 @@ def _consume_sse_full(resp) -> tuple[str, str, bool]:
 # ----------------------------------------------------------------------#
 def _consume_sse_chunks(resp, q) -> bool:
     """消费 SSE 流并放入队列，返回是否正常结束。"""
+    import queue as _q
+
+    def put(item):
+        """有界队列下不无限阻塞；队列满时丢弃普通 chunk，但保留结束标记。"""
+        try:
+            q.put(item, timeout=5)
+        except _q.Full:
+            if item is None or (isinstance(item, tuple) and item[0] == "error"):
+                try:
+                    q.put_nowait(item)
+                except _q.Full:
+                    pass
+            else:
+                logger.warning("[sse_chunks] 队列积压，丢弃一个 chunk")
+
     current_ptype = "text"
     finished = False
     try:
@@ -209,25 +242,19 @@ def _consume_sse_chunks(resp, q) -> bool:
                 continue
 
             if "v" in chunk and isinstance(chunk["v"], dict) and "response" in chunk["v"]:
-                frags = chunk["v"]["response"].get("fragments", [])
-                if frags:
-                    for fr in frags:
-                        ft = fr.get("type", "")
-                        cp = "thinking" if ft == "THINK" else "text"
-                        fc = fr.get("content", "")
-                        if fc:
-                            q.put((cp, fc))
+                try:
+                    for cp, fc in _iter_fragments(chunk["v"].get("response")):
+                        put((cp, fc))
+                except Exception as e:
+                    logger.debug(f"[sse_chunks] 跳过畸形 fragments chunk: {e}")
                 continue
 
             if chunk.get("p") == "response/fragments" and chunk.get("o") == "APPEND":
-                new_frags = chunk.get("v", [])
-                if new_frags:
-                    for fr in new_frags:
-                        ft = fr.get("type", "")
-                        cp = "thinking" if ft == "THINK" else "text"
-                        fc = fr.get("content", "")
-                        if fc:
-                            q.put((cp, fc))
+                try:
+                    for cp, fc in _iter_fragments(chunk.get("v")):
+                        put((cp, fc))
+                except Exception as e:
+                    logger.debug(f"[sse_chunks] 跳过畸形 APPEND chunk: {e}")
                 continue
 
             p = chunk.get("p")
@@ -248,20 +275,20 @@ def _consume_sse_chunks(resp, q) -> bool:
             v = chunk.get("v")
             if isinstance(v, str):
                 if p is None or p in ("response/content", "response/thinking_content"):
-                    q.put((current_ptype, v))
+                    put((current_ptype, v))
             elif isinstance(v, list):
                 if any(isinstance(it, dict) and it.get("p") == "status" and it.get("v") == "FINISHED" for it in v):
                     finished = True
                     break
     except Exception as e:
         logger.warning(f"[sse_chunks] 解析异常: {e}")
-        q.put(("error", str(e)))
+        put(("error", str(e)))
     finally:
         try:
             resp.close()
         except Exception:
             pass
-        q.put(None)
+        put(None)
     return finished
 
 
@@ -788,8 +815,13 @@ class ProviderDeepSeekReverse(Provider):
             raise Exception("浏览器模式未取到最新用户消息（可能整条被系统模板过滤），请调整提问内容后重试")
         logger.info(f"[Browser] 浏览器模式对话开始 session={session_id}")
 
-        # 每次调用前先确认内核可用；缺失时日志里明确提示需要用哪个命令
-        self._diagnose_browser_kernel()
+        # 每次调用前先确认内核可用；缺失时直接给出明确指引，不再空跑换号
+        hint = self._diagnose_browser_kernel()
+        if hint:
+            raise Exception(
+                "浏览器模式未找到可用内核。"
+                "请发送命令 /undeepseek online 下载，或安装 Chrome/Edge。"
+            )
 
         tried = set()
         last_err = None
@@ -822,7 +854,11 @@ class ProviderDeepSeekReverse(Provider):
                 )
                 resp = LLMResponse("assistant")
                 resp.completion_text = text or ""
-                resp.usage = TokenUsage(input_other=0, input_cached=0, output=count_tokens(text or ""))
+                resp.usage = TokenUsage(
+                    input_other=count_tokens(history_prompt + latest_prompt),
+                    input_cached=0,
+                    output=count_tokens(text or ""),
+                )
                 return resp
             except browser_mod.AccountBannedError as e:
                 logger.warning(f"[Browser] 账号 {acct} 被禁言，自动换号重试: {e}")
@@ -985,7 +1021,21 @@ class ProviderDeepSeekReverse(Provider):
 
         import queue as _stdq
 
-        q: _stdq.Queue = _stdq.Queue()
+        # 有界队列：客户端断开后 worker 不会无限堆积 chunk
+        q: _stdq.Queue = _stdq.Queue(maxsize=256)
+        cancelled = {"flag": False}
+
+        def _put(item):
+            """放入队列；若主循环已取消则丢弃，worker 可尽快退出。"""
+            if cancelled["flag"]:
+                return False
+            try:
+                q.put(item, timeout=5)
+                return True
+            except _stdq.Full:
+                logger.warning("[流式请求] 队列积压，丢弃一个 chunk")
+                return False
+
         all_text: list[str] = []
         all_reasoning: list[str] = []
         stream_status = {"finished": True}
@@ -1005,14 +1055,14 @@ class ProviderDeepSeekReverse(Provider):
                 acct = request.state.account  # create_session 可能换号
                 if not sid:
                     logger.error("[流式请求] 创建 DeepSeek 会话失败")
-                    q.put(("error", "创建 DeepSeek 会话失败"))
+                    _put(("error", "创建 DeepSeek 会话失败"))
                     return
                 logger.info(f"[流式请求] 会话创建成功: {sid[:20]}...")
 
                 pow_resp = get_pow_response(request)
                 if not pow_resp:
                     logger.error("[流式请求] 获取 PoW 失败")
-                    q.put(("error", "获取 PoW 失败"))
+                    _put(("error", "获取 PoW 失败"))
                     return
                 logger.debug(f"[流式请求] PoW 获取成功: {pow_resp[:20]}...")
 
@@ -1040,7 +1090,7 @@ class ProviderDeepSeekReverse(Provider):
                 deepseek_resp = chat.call_completion_endpoint(payload, headers, ds_session)
                 if not deepseek_resp:
                     logger.error("[流式请求] completion 请求返回空响应")
-                    q.put(("error", "completion 请求失败"))
+                    _put(("error", "completion 请求失败"))
                     return
                 logger.info("[流式请求] completion 响应收到，开始消费 SSE 流")
 
@@ -1052,7 +1102,7 @@ class ProviderDeepSeekReverse(Provider):
 
             except Exception as e:
                 logger.error(f"[流式请求] 异常: {type(e).__name__}: {e}", exc_info=True)
-                q.put(("error", str(e)))
+                _put(("error", str(e)))
             finally:
                 if not success:
                     _bump_hif_fail(acct)
@@ -1064,22 +1114,27 @@ class ProviderDeepSeekReverse(Provider):
         thread = threading.Thread(target=_stream_worker, daemon=True)
         thread.start()
 
-        while True:
-            item = await asyncio.to_thread(q.get)
-            if item is None:
-                break
-            if isinstance(item, tuple) and len(item) == 2 and item[0] == "error":
-                raise Exception(f"DeepSeek 流式调用失败: {item[1]}")
+        try:
+            while True:
+                item = await asyncio.to_thread(q.get)
+                if item is None:
+                    break
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "error":
+                    raise Exception(f"DeepSeek 流式调用失败: {item[1]}")
 
-            ptype, content = item
-            chunk_resp = LLMResponse("assistant", is_chunk=True)
-            if ptype == "thinking":
-                chunk_resp.reasoning_content = content
-                all_reasoning.append(content)
-            else:
-                chunk_resp.result_chain = MessageChain(chain=[Comp.Plain(content)])
-                all_text.append(content)
-            yield chunk_resp
+                ptype, content = item
+                chunk_resp = LLMResponse("assistant", is_chunk=True)
+                if ptype == "thinking":
+                    chunk_resp.reasoning_content = content
+                    all_reasoning.append(content)
+                else:
+                    chunk_resp.result_chain = MessageChain(chain=[Comp.Plain(content)])
+                    all_text.append(content)
+                yield chunk_resp
+        finally:
+            # 生成器被关闭（客户端断开/取消）时通知 worker 停止产出，
+            # 避免后台线程继续跑完整条流、队列无界增长
+            cancelled["flag"] = True
 
         # 最终完整结果
         final_resp = LLMResponse("assistant")
@@ -1459,7 +1514,7 @@ class Main(Star):
             )
 
             # 下载是阻塞操作，放线程里避免卡住事件循环
-            result = await asyncio.to_thread(setup_mod.download_chromium, rev)
+            result = await asyncio.to_thread(setup_mod.download_chromium, rev, force)
 
             if result.get("ok"):
                 # 让新内核立即生效，无需重载插件

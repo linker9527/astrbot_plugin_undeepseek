@@ -270,11 +270,13 @@ _lock = asyncio.Lock()
 _chat_lock = asyncio.Lock()
 
 # 账号 -> {"context": BrowserContext, "page": Page, "ok": bool}
-# ok=True 表示该账号已确认可登录，其 page 一直复用，不再重建。
+# ok=True 表示该账号已确认可登录，其 context 常驻复用（会话 cookie 保活）。
 _account_sessions: dict = {}
 
-# 被手动验证浏览器替换下来的旧 headless 浏览器，等 close() 时统一关掉
-_retired_browsers: list = []
+# (账号, 会话ID) -> Page：同一账号的不同 AstrBot 会话各用独立标签页，
+# 避免多会话共享一个网页对话导致上下文串味。带 LRU 上限。
+_SESSION_PAGE_LIMIT = 32
+_session_pages: dict = {}
 
 # 会话级 cookie 无法真正持久化，这里只做「尽力而为」的 ck 快照，
 # 供人工排查/导出用；重启后仍需重新登录。
@@ -282,9 +284,13 @@ _active_sessions: set = set()
 
 
 async def _is_logged_in(page) -> bool:
-    """已登录的判断：能见到聊天输入框即视为登录。"""
+    """已登录的判断：能见到聊天输入框即视为登录。
+
+    用短等待（1s）：调用方会在外层按 deadline 反复轮询，
+    单次等太久会让总预算失控。
+    """
     try:
-        await page.locator(SEL_CHAT_INPUT).first.wait_for(state="visible", timeout=5000)
+        await page.locator(SEL_CHAT_INPUT).first.wait_for(state="visible", timeout=1000)
         return True
     except Exception:
         return False
@@ -304,9 +310,6 @@ LOGIN_FAIL_HINTS = [
     "请完成验证",
     "请进行验证",
 ]
-
-# 这些提示在登录页一进来就存在，不能作为「本次登录失败」的依据
-PRE_EXISTING_HINTS = ["登录信息已失效", "验证码登录"]
 
 
 class LoginFailedError(Exception):
@@ -382,9 +385,12 @@ async def _do_login(page, account: str, password: str):
     if not clicked:
         raise LoginFailedError("未找到可见的登录按钮")
 
-    # 5. 等进入聊天页：轮询判断，同时检测是否出现**新增的**错误提示
-    #    最多等 20 秒；一旦看到明确的登录失败提示立即抛出，不空等到超时
-    for step in range(20):
+    # 5. 等进入聊天页：以真实 deadline 控制总预算（约 20 秒），
+    #    一旦看到明确的登录失败提示立即抛出，不空等到超时
+    import time as _t
+
+    deadline = _t.time() + 20
+    while _t.time() < deadline:
         if await _is_logged_in(page):
             logger.info("[Browser] 网页登录成功")
             # 登录成功即清除该账号的「待人工登录」标记
@@ -420,13 +426,16 @@ async def _do_login(page, account: str, password: str):
     )
 
 
-async def _ensure_browser() -> None:
-    """只启动一次浏览器，常驻不关（会话级 cookie 只能靠进程内保活）。"""
+async def _ensure_browser(exe_override: str = "") -> None:
+    """只启动一次浏览器，常驻不关（会话级 cookie 只能靠进程内保活）。
+
+    exe_override 允许调用方指定内核路径（如启动期探测），不传则自行探测。
+    """
     global _pw, _browser
     if _browser is not None and _browser.is_connected():
         return
 
-    exe_path = refresh_chrome_exe()
+    exe_path = exe_override or refresh_chrome_exe()
     if not exe_path:
         raise RuntimeError(
             "未找到可用的浏览器内核。请任选一种方式：\n"
@@ -473,7 +482,7 @@ async def _ensure_page(account: str, password: str):
                 and not cached["page"].is_closed()):
             try:
                 await cached["page"].title()  # 探活
-                return cached["page"]
+                return cached
             except Exception:  # noqa: BLE001
                 pass
 
@@ -540,7 +549,7 @@ async def _ensure_page(account: str, password: str):
         except Exception:  # noqa: BLE001
             pass
 
-        return page
+        return _account_sessions[account]
 
 
 async def _wait_reply(page, timeout: int, base_count: int = 0):
@@ -607,9 +616,6 @@ async def _wait_reply(page, timeout: int, base_count: int = 0):
 
 
 
-_active_sessions: set = set()
-
-
 async def _send(page, text: str) -> int:
     """向输入框发送一条消息，返回发送前已有的回复块数（作为新回复的基准）。"""
     base = 0
@@ -650,13 +656,29 @@ async def chat(
     会话(session_id)首次：先喂完整历史（丢弃其回复），再发最新问题并返回答案。
     会话后续：复用同一页面，只发最新消息（网页端自己记住历史），上下文连续、不反复新建。
     """
-    # 单页面全局共享，整个"发历史→发问题→等回复"流程必须串行执行
+    # 单浏览器全局共享，整个"发历史→发问题→等回复"流程必须串行执行
     async with _chat_lock:
-        page = await _ensure_page(account, password)
+        sess = await _ensure_page(account, password)
+        key = (account, session_id or "_default")
+        page = _session_pages.get(key)
+        if page is None or page.is_closed():
+            # 会话数超限时淘汰最早创建的标签页（保留登录态所在的 context）
+            if len(_session_pages) >= _SESSION_PAGE_LIMIT:
+                for old_key, old_page in list(_session_pages.items())[:1]:
+                    try:
+                        await old_page.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _session_pages.pop(old_key, None)
+            page = await sess["context"].new_page()
+            await page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=60000)
+            _session_pages[key] = page
+            _active_sessions.add(key)
+            is_first = True
+        else:
+            is_first = False
 
-        is_first = bool(session_id) and session_id not in _active_sessions
         if is_first:
-            _active_sessions.add(session_id)
             # 首次：先发历史作为上下文（不返回它的回复），再发最新问题
             if history_prompt.strip():
                 logger.info(f"[Browser] 会话 {session_id} 首次，喂入历史 {len(history_prompt)} 字")
@@ -679,19 +701,42 @@ async def chat(
             raise
 
 
-def replace_browser(pw, browser) -> None:
+async def replace_browser(pw, browser) -> None:
     """用外部已登录的浏览器（有头）替换常驻浏览器。
 
     手动验证窗口是独立 Playwright 实例，context 无法跨实例复用；
     验证成功后直接把整个浏览器升格为常驻浏览器，后续账号都在这里开窗口。
+    旧浏览器的 context 立即从池中移除并关闭，避免 #18 的悬挂引用。
     """
     global _pw, _browser
     old_browser, old_pw = _browser, _pw
     _pw, _browser = pw, browser
+
+    # 属于旧浏览器的常驻窗口全部作废（不能跨实例复用）
+    for acc, sess in list(_account_sessions.items()):
+        try:
+            await sess["context"].close()
+        except Exception:  # noqa: BLE001
+            pass
+        _account_sessions.pop(acc, None)
+    for k, p in list(_session_pages.items()):
+        try:
+            await p.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _session_pages.clear()
+    _active_sessions.clear()
+
     if old_browser is not None and old_browser is not browser:
-        # 旧 headless 浏览器已无账号窗口在用，交给 close() 统一清理，
-        # 避免在没有运行中事件循环时 create_task 失败
-        _retired_browsers.append(old_browser)
+        try:
+            await old_browser.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if old_pw is not None and old_pw is not pw:
+        try:
+            await old_pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
     logger.info("[Browser] 常驻浏览器已替换为手动验证通过的浏览器")
 
 
@@ -704,12 +749,21 @@ def adopt_session(account: str, context, page) -> None:
 def invalidate_account(account: str) -> None:
     """标记某账号的常驻窗口失效（下次会重新建），供外部/异常路径调用。"""
     sess = _account_sessions.pop(account, None)
+    for k, p in list(_session_pages.items()):
+        if k[0] == account:
+            try:
+                import asyncio as _a
+
+                _a.get_running_loop().create_task(p.close())
+            except Exception:  # noqa: BLE001
+                pass
+            _session_pages.pop(k, None)
+            _active_sessions.discard(k)
     if sess:
         try:
             import asyncio as _a
 
-            loop = _a.get_running_loop()
-            loop.create_task(sess["context"].close())
+            _a.get_running_loop().create_task(sess["context"].close())
         except Exception:  # noqa: BLE001
             pass
 
@@ -727,16 +781,19 @@ async def close():
             except Exception:  # noqa: BLE001
                 pass
         _account_sessions.clear()
+        _session_pages.clear()
         _active_sessions.clear()
-        for old in _retired_browsers:
-            try:
-                await old.close()
-            except Exception:  # noqa: BLE001
-                pass
-        _retired_browsers.clear()
         try:
             if _browser is not None:
                 await _browser.close()
         except Exception:  # noqa: BLE001
             pass
+        # 关键：async_playwright().start() 拉起的 driver（node 子进程）
+        # 必须 stop()，只关 Chromium 会残留一堆 node.exe
+        retired_pw = _pw
         _browser = _pw = None
+    if retired_pw is not None:
+        try:
+            await retired_pw.stop()
+        except Exception:  # noqa: BLE001
+            pass

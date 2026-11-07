@@ -49,9 +49,10 @@ async def main():
         )
         page = await ctx.new_page()
 
-        # 已有登录态的话先加载，可能还在有效期内
+        # 会话级 cookie 无法跨浏览器重启存活，这里不做「复用」的假承诺；
+        # 只是提示该文件存在，仍需要用户手动完成一次登录。
         if os.path.isfile(state_file):
-            print("检测到已有登录态，将尝试复用...")
+            print("检测到历史登录态快照（会话级 cookie，通常已失效，需重新登录）")
         await page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=60000)
 
         # 关键第一步：默认是「验证码登录」模式（只有手机号输入框），

@@ -37,8 +37,14 @@ class AccountPool:
                 seen.add(ident)
                 if ident in existing:
                     old = existing[ident]
+                    # 配置字段显式覆盖：改密码/改账号类型立即生效
                     for k, v in acct.items():
-                        old.setdefault(k, v)
+                        old[k] = v
+                    # 运行时字段复位：重载时不能把旧 _busy 带进新池，
+                    # 否则曾经忙过的账号会永久无法 acquire
+                    old["_busy"] = False
+                    old["_guard"] = None
+                    old["_last_released"] = 0.0
                     new_accounts.append(old)
                 else:
                     new_accounts.append({**acct, "_busy": False, "_last_released": 0.0})

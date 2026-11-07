@@ -47,17 +47,6 @@ def _data_dir() -> str:
         )
 
 
-def _page_json_path() -> str:
-    """配置页可读的公开清单（只含账号名，不含密码）。"""
-    d = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "pages",
-        "deepseek_reverse",
-    )
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "pending_login.json")
-
-
 def _state_path() -> str:
     d = _data_dir()
     os.makedirs(d, exist_ok=True)
@@ -107,19 +96,9 @@ def _save(data: dict) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning("[PendingLogin] 状态写入失败: %s", e)
 
-    # 公开清单：只保留账号名与时间，绝不写密码，供配置页渲染
-    try:
-        public = {
-            "accounts": [
-                {"account": k, "since": (v or {}).get("since", 0)}
-                for k, v in (data.get("accounts") or {}).items()
-            ]
-        }
-        pp = _page_json_path()
-        with open(pp, "w", encoding="utf-8") as f:
-            json.dump(public, f, ensure_ascii=False, indent=2)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[PendingLogin] 公开清单写入失败: %s", e)
+    # 清单现在由后端 GET /login/pending 提供（页面用 apiGet 读，自动带认证），
+    # 不再往插件包 pages/ 目录写文件：插件更新会覆盖、只读部署会失败。
+    # 状态文件只存 plugin_data 下，且带密码，chmod 600。
 
 
 def mark_needs_login(identifier: str, password: str = "", reason: str = "") -> None:

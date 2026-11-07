@@ -111,10 +111,18 @@ class PageApi:
             old = _manual_sessions.pop(account, None)
             if old:
                 try:
-                    await old["browser"].close()
+                    if old.get("browser"):
+                        await old["browser"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    if old.get("pw"):
+                        await old["pw"].stop()
                 except Exception:  # noqa: BLE001
                     pass
 
+            pw = None
+            browser = None
             try:
                 pw = await async_playwright().start()
                 browser = await pw.chromium.launch(
@@ -159,6 +167,17 @@ class PageApi:
                 return self._ok({"account": account}, "验证窗口已打开")
             except Exception as e:  # noqa: BLE001
                 logger.error("[PageApi] 打开验证窗口失败: %s: %s", type(e).__name__, e)
+                # 失败路径必须停掉 driver，否则残留 node 子进程
+                try:
+                    if browser:
+                        await browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    if pw:
+                        await pw.stop()
+                except Exception:  # noqa: BLE001
+                    pass
                 return self._err(f"打开验证窗口失败: {type(e).__name__}: {e}")
 
     async def login_check(self) -> dict:
@@ -169,12 +188,19 @@ class PageApi:
         if not session:
             return self._err("没有进行中的验证窗口，请先点「进行邮箱验证」")
 
+        # 校验：该账号确实在插件配置里（防止把任意账号名塞进来领走别人的窗口）
+        if not self._account_password(account):
+            return self._err(f"账号 {account} 不在插件配置中，拒绝验证")
+
         from . import browser as browser_mod
         from . import pending_login
 
         page = session["page"]
         try:
             logged = await browser_mod._is_logged_in(page)
+            # 必须真的跳转到聊天页，不能只凭 textarea 出现
+            if logged and "/sign_in" in (page.url or ""):
+                logged = False
         except Exception as e:  # noqa: BLE001
             return self._err(f"检测失败: {type(e).__name__}: {e}")
 
@@ -197,7 +223,7 @@ class PageApi:
         # 关键：有头浏览器与 headless 常驻浏览器是两个独立 Playwright 实例，
         # context 不能跨实例复用。因此直接把这个「已登录的有头浏览器」升格为
         # 插件的常驻浏览器，后续所有账号都在这个进程里开 context。
-        browser_mod.replace_browser(session["pw"], session["browser"])
+        await browser_mod.replace_browser(session["pw"], session["browser"])
         browser_mod.adopt_session(account, context, page)
         session["done"] = True
         # 已升格，不能再关掉这个浏览器
@@ -235,6 +261,11 @@ async def close_all_manual() -> None:
                 continue
             try:
                 await br.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if s.get("pw"):
+                    await s["pw"].stop()
             except Exception:  # noqa: BLE001
                 pass
         _manual_sessions.clear()

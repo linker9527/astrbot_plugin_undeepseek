@@ -19,9 +19,6 @@ from . import pending_login
 
 DEEPSEEK_URL = "https://chat.deepseek.com/"
 
-# 探测结果缓存（秒）：短时间内重复重载不再全量探测，减少风控风险
-PROBE_CACHE_TTL = 10 * 60
-
 
 def _probe_sync(accounts: list[dict], browser_exe: str) -> dict:
     """同步入口，在后台线程里调用。"""
@@ -97,7 +94,7 @@ async def _probe_all_async(accounts: list[dict], browser_exe: str) -> dict:
 
     # 复用插件的常驻浏览器：探测成功的 context 会留在池子里继续用，
     # 绝不在这里 close 浏览器，否则会话级 cookie 全丢。
-    await browser_mod._ensure_browser()
+    await browser_mod._ensure_browser(browser_exe)
     browser = browser_mod._browser
 
     for item in accounts:

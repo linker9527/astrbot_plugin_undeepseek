@@ -3,3 +3,5 @@ wasmtime
 transformers
 tiktoken
 playwright>=1.40
+httpx
+fastapi

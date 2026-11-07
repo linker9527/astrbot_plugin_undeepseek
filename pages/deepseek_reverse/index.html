@@ -95,8 +95,13 @@
   <script>
     const models = [
       { id: "deepseek-v4-flash", desc: "快速对话" },
-      { id: "deepseek-v4-thinking", desc: "深度思考" },
-      { id: "deepseek-r1", desc: "R1 推理" },
+      { id: "deepseek-v4-flash-search", desc: "快速对话·联网" },
+      { id: "deepseek-chat", desc: "通用对话" },
+      { id: "deepseek-chat-search", desc: "通用对话·联网" },
+      { id: "deepseek-reasoner", desc: "深度思考" },
+      { id: "deepseek-reasoner-search", desc: "深度思考·联网" },
+      { id: "deepseek-v4-pro", desc: "高阶模型" },
+      { id: "deepseek-v4-pro-search", desc: "高阶模型·联网" },
     ];
     const list = document.getElementById("modelList");
     models.forEach(m => {

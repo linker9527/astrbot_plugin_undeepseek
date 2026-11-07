@@ -910,15 +910,36 @@ def detect_and_parse_tool_calls(content: str):
     tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls|function_calls|tools|invoke|parameter)(?:\s+[^>]*)?>"
     content_clean = re.sub(tool_wrapper_re, "", original_content, flags=re.IGNORECASE).strip()
 
-    # 代码围栏检测：如果 tool_call 标记在未闭合的 ``` 中则跳过
-    func_tag_idx = original_content.lower().find("<function_calls>")
-    xml_tag_idx = original_content.lower().find("<tool_call")
-    if func_tag_idx != -1 and is_inside_code_fence(original_content[:func_tag_idx + len("<function_calls>")], "<function_calls>"):
-        func_tag_idx = -1
-    if xml_tag_idx != -1 and is_inside_code_fence(original_content[:xml_tag_idx + len("<tool_call>")], "<tool_call>"):
-        xml_tag_idx = -1
+    # 代码围栏区间：``` 成对出现，奇数段内的内容视为代码示例，
+    # 其中的 tool_call / function_calls 一律不当真执行。
+    def _fenced_spans(text: str):
+        spans = []
+        pos = 0
+        low = text.lower()
+        while True:
+            i = low.find("```", pos)
+            if i < 0:
+                break
+            j = low.find("```", i + 3)
+            if j < 0:
+                spans.append((i, len(text)))  # 未闭合围栏，直到文末
+                break
+            spans.append((i, j + 3))
+            pos = j + 3
+        return spans
+
+    fenced = _fenced_spans(original_content)
+
+    def _in_fence(idx: int) -> bool:
+        return any(a <= idx < b for a, b in fenced)
+
+    def _filter_spans(calls, spans):
+        """丢弃落在围栏内的解析结果，保持 calls 与 spans 一一对应。"""
+        kept = [(c, s) for c, s in zip(calls, spans) if not _in_fence(s[0])]
+        return [c for c, _ in kept], [s for _, s in kept]
 
     function_calls, function_spans = _parse_function_calls_block(original_content)
+    function_calls, function_spans = _filter_spans(function_calls, function_spans)
     if function_calls:
         remaining_parts = []
         last = 0
@@ -931,6 +952,7 @@ def detect_and_parse_tool_calls(content: str):
         return _normalize_tool_calls(function_calls), remaining_content
 
     xml_calls, xml_spans = _parse_xml_tool_calls(original_content)
+    xml_calls, xml_spans = _filter_spans(xml_calls, xml_spans)
     if xml_calls:
         remaining_parts = []
         last = 0
@@ -942,12 +964,17 @@ def detect_and_parse_tool_calls(content: str):
         remaining_content = re.sub(tool_wrapper_re, "", remaining_content, flags=re.IGNORECASE).strip()
         return _normalize_tool_calls(xml_calls), remaining_content
 
-    # JSON 检测（支持修复）
+    # JSON 检测（支持修复）；content_clean 是去掉 wrapper 标签后的文本，
+    # 用原始围栏区间近似判断（长度差异很小，不影响围栏定位）
     for start, end, json_str in _find_balanced_json_values(content_clean):
+        if _in_fence(start):
+            continue
         parsed, used_repair = _try_parse_json_with_repair(json_str)
         if parsed is None:
             continue
 
+        # 循环开头初始化，避免任一分支未赋值时抛 UnboundLocalError
+        valid_calls = []
         if isinstance(parsed, list):
             # 仅接受 OpenAI function-call 形态的列表项（带 function.name），
             # 避免普通 JSON 数组（如 [{"name": "张三", ...}]）被误判为工具调用
@@ -958,6 +985,8 @@ def detect_and_parse_tool_calls(content: str):
                 for it in parsed
             ):
                 valid_calls = _normalize_tool_calls(parsed)
+            else:
+                continue
         elif not isinstance(parsed, dict):
             continue
         elif "tool_calls" in parsed:
@@ -1039,7 +1068,13 @@ def call_completion_endpoint(payload, headers, session, max_attempts=MAX_RETRIES
 # ----------------------------------------------------------------------
 # 创建会话 —— 指数退避 + 配置模式下账号轮换
 # ----------------------------------------------------------------------
-def create_session(request, max_attempts=MAX_RETRIES):
+def create_session(request, max_attempts=MAX_RETRIES, allow_switch=True):
+    """创建会话。
+
+    allow_switch=False 用于健康检查：只允许测指定账号，失败即返回 None，
+    绝不换号（否则会把新账号的 token 写回 request.state，健康检查却仍用
+    原账号的 session 发 completion，造成身份混用与池位泄漏）。
+    """
     attempts = 0
     while attempts < max_attempts:
         headers = {
@@ -1053,6 +1088,7 @@ def create_session(request, max_attempts=MAX_RETRIES):
                 headers=headers,
                 json={},
                 impersonate="safari15_3",
+                timeout=30,
             )
         except Exception as e:
             wait = RETRY_DELAYS[min(attempts, len(RETRY_DELAYS) - 1)]
@@ -1068,11 +1104,25 @@ def create_session(request, max_attempts=MAX_RETRIES):
             data = {}
 
         if resp.status_code == 200 and data.get("code") == 0:
-            biz_data = data["data"]["biz_data"]
-            if "chat_session" in biz_data:
-                session_id = biz_data["chat_session"]["id"]
-            else:
-                session_id = biz_data["id"]
+            # 结构可能随服务端变化，直接下标会抛 KeyError/TypeError；
+            # 校验失败当作本次失败走重试，而不是把异常抛到上层
+            try:
+                biz_data = data["data"]["biz_data"]
+                if not isinstance(biz_data, dict):
+                    raise ValueError("biz_data 不是对象")
+                if "chat_session" in biz_data:
+                    session_id = biz_data["chat_session"]["id"]
+                else:
+                    session_id = biz_data["id"]
+                if not session_id:
+                    raise ValueError("会话 id 为空")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[create_session] 响应结构异常: {e}")
+                resp.close()
+                wait = RETRY_DELAYS[min(attempts, len(RETRY_DELAYS) - 1)]
+                time.sleep(wait)
+                attempts += 1
+                continue
             resp.close()
             return session_id
 
@@ -1082,7 +1132,11 @@ def create_session(request, max_attempts=MAX_RETRIES):
         )
         resp.close()
 
-        if getattr(request.state, "use_config_token", False):
+        if not allow_switch:
+            logger.warning("[create_session] 健康检查模式：禁止换号，直接结束")
+            break
+
+        if getattr(request.state, "use_config_token", False) and allow_switch:
             current_id = get_account_identifier(request.state.account)
             if not hasattr(request.state, "tried_accounts"):
                 request.state.tried_accounts = []

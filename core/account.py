@@ -81,6 +81,7 @@ def login_deepseek_via_account(account):
             headers=constants.BASE_HEADERS,
             json=payload,
             impersonate="safari15_3",
+            timeout=30,
         )
         resp.raise_for_status()
     except Exception as e:
@@ -334,6 +335,7 @@ def account_health_check(account, timeout=30):
 
     acc_id = constants.get_account_identifier(account)
     logger.info(f"[health_check] 开始健康检查账号: {acc_id}")
+    fake_req = None
 
     try:
         # 1. 登录
@@ -342,24 +344,28 @@ def account_health_check(account, timeout=30):
         else:
             ensure_hif_tokens(account)
 
-        # 2. 创建会话 —— 需要伪造一个 request 对象
+        # 2. 创建会话 —— 伪造 request，且禁止换号（只测这一个账号）
         class _FakeRequest:
             class state:
                 deepseek_token = account.get("token")
                 account = account
                 use_config_token = True
+                tried_accounts = []
         fake_req = _FakeRequest()
 
-        session_id = create_session(fake_req)
+        session_id = create_session(fake_req, allow_switch=False)
         if not session_id:
             logger.warning(f"[health_check] {acc_id} 创建会话失败")
             return False
+
+        # 全程统一用 fake_req.state.account：即便将来允许换号也不会身份混用
+        active = fake_req.state.account
 
         # 3. 获取 PoW
         pow_resp = get_pow_response(fake_req)
         if not pow_resp:
             logger.warning(f"[health_check] {acc_id} 获取 PoW 失败")
-            _delete_session_for_health(account, session_id, fake_req)
+            _delete_session_for_health(active, session_id, fake_req)
             return False
 
         # 4. 发送一条 mini completion
@@ -380,11 +386,11 @@ def account_health_check(account, timeout=30):
             "preempt": False,
         }
 
-        ds_session = session_module.get_account_session(account)
+        ds_session = session_module.get_account_session(active)
         resp = call_completion_endpoint(payload, headers, ds_session, max_attempts=2)
         if not resp or resp.status_code != 200:
             logger.warning(f"[health_check] {acc_id} completion 请求失败")
-            _delete_session_for_health(account, session_id, fake_req)
+            _delete_session_for_health(active, session_id, fake_req)
             if resp:
                 resp.close()
             return False
@@ -399,7 +405,7 @@ def account_health_check(account, timeout=30):
             resp.close()
 
         # 6. 删除会话
-        _delete_session_for_health(account, session_id, fake_req)
+        _delete_session_for_health(active, session_id, fake_req)
 
         logger.info(f"[health_check] {acc_id} 健康检查通过")
         return True
@@ -407,6 +413,15 @@ def account_health_check(account, timeout=30):
     except Exception as e:
         logger.warning(f"[health_check] {acc_id} 健康检查异常: {e}")
         return False
+    finally:
+        # 若将来允许换号，这里保证新账号一定被释放，不泄漏池位
+        if fake_req is not None:
+            try:
+                swapped = getattr(fake_req.state, "account", None)
+                if swapped is not None and swapped is not account:
+                    release_account(swapped)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _delete_session_for_health(account, session_id, fake_req):
@@ -428,9 +443,26 @@ def _delete_session_for_health(account, session_id, fake_req):
         pass
 
 
-def run_health_checks(max_concurrent=10):
-    """启动时并发执行所有账号的健康检查，丢弃不健康的账号。"""
+# 健康检查缓存：同一进程内 10 分钟内不重复全量检查（避免频繁触发风控）
+_HEALTH_CHECK_TTL = 10 * 60
+_last_health_check_at = 0.0
+
+
+def run_health_checks(max_concurrent=10, force=False):
+    """启动时并发执行所有账号的健康检查（仅记录结果，不改池子）。
+
+    失败账号保留在池子里，靠 hif_fetch_fail_count 做运行时降级；
+    直接把失败者移出池子会让一次网络抖动就永久损失一个账号。
+    带时间窗缓存，避免每次插件重载都做一轮真实登录 + completion。
+    """
     import threading
+
+    global _last_health_check_at
+    now = time.time()
+    if not force and now - _last_health_check_at < _HEALTH_CHECK_TTL:
+        logger.info("[health_check] 距上次检查不足 10 分钟，跳过")
+        return
+    _last_health_check_at = now
 
     all_accounts = account_pool.all_accounts()
     if not all_accounts:
@@ -453,22 +485,19 @@ def run_health_checks(max_concurrent=10):
 
     threads = []
     for acct in all_accounts:
-        t = threading.Thread(target=check_one, args=(acct,))
+        t = threading.Thread(target=check_one, args=(acct,), daemon=True)
         t.start()
         threads.append(t)
 
     for t in threads:
         t.join()
 
-    # 用健康的账号重建池
-    if passed:
-        account_pool.load(passed)
-        logger.info(f"[health_check] {len(passed)} 个账号通过健康检查")
+    logger.info(
+        f"[health_check] 检查完成：{len(passed)} 通过 / {len(failed)} 未通过"
+        "（失败账号保留在池中，由运行时降级处理）"
+    )
     if failed:
-        logger.warning(f"[health_check] {len(failed)} 个账号未通过健康检查: "
-                       f"{[constants.get_account_identifier(a) for a in failed]}")
-
-    # 如果所有账号都失败，仍然保留原始配置（降级运行）
-    if not passed:
-        logger.error("[health_check] 所有账号均未通过健康检查，降级使用原始配置")
-        account_pool.load(all_accounts)
+        logger.warning(
+            f"[health_check] 未通过: "
+            f"{[constants.get_account_identifier(a) for a in failed]}"
+        )
