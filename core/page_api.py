@@ -34,13 +34,14 @@ class PageApi:
             logger.warning("[PageApi] 当前 AstrBot 版本不支持拓展页 API 注册")
             return
         routes = [
+            ("/login/pending", self.login_pending, ["GET"], "待邮箱验证账号清单"),
             ("/login/start", self.login_start, ["POST"], "打开有头浏览器进行邮箱验证"),
             ("/login/check", self.login_check, ["POST"], "检测验证结果并保存登录态"),
             ("/login/status", self.login_status, ["GET"], "查询验证窗口状态"),
         ]
         for path, handler, methods, desc in routes:
             register(f"{PAGE_API_PREFIX}{path}", handler, methods, desc)
-        logger.info("[PageApi] 已注册 3 个手动验证 API")
+        logger.info("[PageApi] 已注册 4 个手动验证 API")
 
     @staticmethod
     def _ok(data=None, message="ok"):
@@ -70,6 +71,24 @@ class PageApi:
             return await request.get_json(silent=True) or {}
         except Exception:  # noqa: BLE001
             return {}
+
+    async def login_pending(self) -> dict:
+        """返回待邮箱验证的账号清单（只含账号名，绝不含密码）。"""
+        from . import pending_login
+
+        try:
+            items = pending_login.list_pending()
+            return self._ok(
+                {
+                    "accounts": [
+                        {"account": x["account"], "since": x.get("since", 0)}
+                        for x in items
+                    ]
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[PageApi] 读取待验证清单失败: %s", e)
+            return self._ok({"accounts": []})
 
     async def login_start(self) -> dict:
         """打开有头浏览器，切到密码登录并预填账号密码。"""

@@ -140,14 +140,16 @@
         }
         if (!avoidBan) { card.style.display = "none"; return []; }
 
-        // 2) 读公开清单（只含账号名，不含密码）
+        // 2) 通过后端 API 读待验证清单（bridge 自动带认证，
+        //    不走静态文件：iframe 的 fetch 相对路径会丢 asset_token 导致 401）
         let pending = [];
         try {
-          const r = await fetch("./pending_login.json", { cache: "no-store" });
-          if (r.ok) {
-            const j = await r.json();
-            pending = (j && j.accounts) || [];
-          }
+          const r = await bridge.apiGet(API + "/login/pending");
+          // bridge 可能把响应的 data 解出来（{accounts:[...]}），
+          // 也可能原样返回（{status,data:{accounts:[...]}}），两种都兼容
+          const d = r || {};
+          const inner = d.data || d;
+          pending = (inner && inner.accounts) || (d.accounts) || [];
         } catch (e) {
           console.warn("[undeepseek] 读取待验证清单失败:", e);
         }
@@ -188,9 +190,10 @@
             start.textContent = "打开中…";
             try {
               const r = await bridge.apiPost(API + "/login/start", { account: acc });
-              const d = r && (r.data || r);
-              if (d && d.status === "error") { alert(d.message || "打开失败"); }
-              else { start.textContent = "已打开"; }
+              const d = r || {};
+              if (d.status === "error" || (d.data && d.data.status === "error")) {
+                alert(d.message || (d.data && d.data.message) || "打开失败");
+              } else { start.textContent = "已打开"; }
             } catch (e) {
               alert("打开验证窗口失败: " + e);
             } finally {
@@ -207,12 +210,13 @@
             recheck.textContent = "检测中…";
             try {
               const r = await bridge.apiPost(API + "/login/check", { account: acc });
-              const d = r && (r.data || r);
-              if (d && d.status === "ok" && d.data && d.data.logged_in) {
+              const d = r || {};
+              const inner = d.data || d;
+              if (inner.logged_in === true) {
                 // 成功：保存 ck、窗口纳管、清单移除，刷新板块
                 await render();
               } else {
-                alert((d && d.message) || "尚未登录成功，请在打开的浏览器里完成验证");
+                alert(d.message || inner.message || "尚未登录成功，请在打开的浏览器里完成验证");
                 recheck.textContent = "重新检测";
               }
             } catch (e) {
