@@ -35,45 +35,55 @@ async def _probe_one(account: str, password: str, browser) -> str:
     ctx = await browser.new_context(
         viewport={"width": 1280, "height": 800}, locale="zh-CN"
     )
+    keep = False
     try:
         page = await ctx.new_page()
         await page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=60000)
 
         # 已有登录态能直接进聊天页 -> 直接判为可用
-        if await browser_mod._is_logged_in(page):
-            return "ok"
-
-        try:
+        if not await browser_mod._is_logged_in(page):
             await browser_mod._do_login(page, account, password)
-            return "ok"
-        except browser_mod.ManualLoginRequiredError as e:
-            logger.error(
-                "[Browser] 账号 %s 需要先在此电脑的任意浏览器进行一次登录"
-                "（DeepSeek 要求邮箱验证/人机验证，页面提示: %s）",
-                account,
-                e,
-            )
-            return "manual"
-        except browser_mod.LoginFailedError as e:
-            logger.warning("[Browser] 账号 %s 登录探测失败: %s", account, e)
-            return "fail"
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "[Browser] 账号 %s 登录探测异常: %s: %s",
-                account,
-                type(e).__name__,
-                e,
-            )
-            return "fail"
-    finally:
+        # 走到这里说明能进：把窗口收编进常驻池，并保存一份 ck 快照
+        browser_mod.adopt_session(account, ctx, page)
         try:
-            await ctx.close()
-        except Exception:  # noqa: BLE001
-            pass
+            state_path = browser_mod._storage_path(account)
+            await ctx.storage_state(path=state_path)
+            browser_mod._restrict_permissions(state_path)
+            logger.info("[Browser] 账号 %s 登录态已保存(ck): %s", account, state_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Browser] 账号 %s ck 快照保存失败: %s", account, e)
+        keep = True
+        return "ok"
+    except browser_mod.ManualLoginRequiredError as e:
+        logger.error(
+            "[Browser] 账号 %s 需要先在此电脑的任意浏览器进行一次登录"
+            "（DeepSeek 要求邮箱验证/人机验证，页面提示: %s）",
+            account,
+            e,
+        )
+        return "manual"
+    except browser_mod.LoginFailedError as e:
+        logger.warning("[Browser] 账号 %s 登录探测失败: %s", account, e)
+        return "fail"
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[Browser] 账号 %s 登录探测异常: %s: %s",
+            account,
+            type(e).__name__,
+            e,
+        )
+        return "fail"
+    finally:
+        # 进不去的：不保存 context、不写 ck，直接关掉
+        if not keep:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _probe_all_async(accounts: list[dict], browser_exe: str) -> dict:
-    from playwright.async_api import async_playwright
+    from . import browser as browser_mod
 
     result = {"ok": [], "manual": [], "fail": [], "skipped": False}
     if not accounts:
@@ -85,41 +95,34 @@ async def _probe_all_async(accounts: list[dict], browser_exe: str) -> dict:
     )
     t0 = time.time()
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            executable_path=browser_exe,
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        try:
-            for item in accounts:
-                identifier = item.get("email") or item.get("mobile") or ""
-                pwd = item.get("password", "")
-                if not identifier or not pwd:
-                    continue
-                try:
-                    verdict = await _probe_one(identifier, pwd, browser)
-                except Exception as e:  # noqa: BLE001
-                    verdict = "fail"
-                    logger.warning(
-                        "[Browser] 账号 %s 探测出错: %s: %s",
-                        identifier,
-                        type(e).__name__,
-                        e,
-                    )
-                result[verdict].append(identifier)
+    # 复用插件的常驻浏览器：探测成功的 context 会留在池子里继续用，
+    # 绝不在这里 close 浏览器，否则会话级 cookie 全丢。
+    await browser_mod._ensure_browser()
+    browser = browser_mod._browser
 
-                if verdict == "ok":
-                    pending_login.mark_logged_in(identifier)
-                elif verdict == "manual":
-                    pending_login.mark_needs_login(
-                        identifier, pwd, "启动期探测：需要邮箱验证/人机验证"
-                    )
-        finally:
-            try:
-                await browser.close()
-            except Exception:  # noqa: BLE001
-                pass
+    for item in accounts:
+        identifier = item.get("email") or item.get("mobile") or ""
+        pwd = item.get("password", "")
+        if not identifier or not pwd:
+            continue
+        try:
+            verdict = await _probe_one(identifier, pwd, browser)
+        except Exception as e:  # noqa: BLE001
+            verdict = "fail"
+            logger.warning(
+                "[Browser] 账号 %s 探测出错: %s: %s",
+                identifier,
+                type(e).__name__,
+                e,
+            )
+        result[verdict].append(identifier)
+
+        if verdict == "ok":
+            pending_login.mark_logged_in(identifier)
+        elif verdict == "manual":
+            pending_login.mark_needs_login(
+                identifier, pwd, "启动期探测：需要邮箱验证/人机验证"
+            )
 
     logger.info(
         "[Browser] 启动期账号登录探测完成（耗时 %.1fs）："

@@ -259,18 +259,23 @@ class AccountBannedError(Exception):
 # 禁言提示的精确信号词（匹配完整提示句，越长越不容易误命中正常提示）
 BAN_KEYWORD = "由于违法用户使用规范，你的账号已被禁言至"
 
-# 全局单例（跨请求复用浏览器与登录态）
+# 全局单例：浏览器只启动一次，常驻不关。
+# 会话级 cookie（ds_session_id）不落盘，只能靠「浏览器不关、context 常驻」保住，
+# 因此每个账号一个独立 context 缓存在池子里，绝不 close 掉还能用的 context。
 _pw = None
 _browser = None
-_context = None
-_page = None
-_current_account = None
 _lock = asyncio.Lock()
-# 对话全程锁：所有账号/会话共用一个页面，发送与等待回复必须串行，
-# 否则并发请求的消息会交错进同一聊天框、回复互相串会话
+# 对话全程锁：所有账号/会话共用一个浏览器，发送与等待回复必须串行，
+# 否则并发请求会交错操作页面
 _chat_lock = asyncio.Lock()
-# 强制重建标志：被顶会话/超时后置位，让下一次 _ensure_page 跳过复用、重新登录
-_force_rebuild = False
+
+# 账号 -> {"context": BrowserContext, "page": Page, "ok": bool}
+# ok=True 表示该账号已确认可登录，其 page 一直复用，不再重建。
+_account_sessions: dict = {}
+
+# 会话级 cookie 无法真正持久化，这里只做「尽力而为」的 ck 快照，
+# 供人工排查/导出用；重启后仍需重新登录。
+_active_sessions: set = set()
 
 
 async def _is_logged_in(page) -> bool:
@@ -412,102 +417,107 @@ async def _do_login(page, account: str, password: str):
     )
 
 
+async def _ensure_browser() -> None:
+    """只启动一次浏览器，常驻不关（会话级 cookie 只能靠进程内保活）。"""
+    global _pw, _browser
+    if _browser is not None and _browser.is_connected():
+        return
+
+    exe_path = refresh_chrome_exe()
+    if not exe_path:
+        raise RuntimeError(
+            "未找到可用的浏览器内核。请任选一种方式：\n"
+            "  1) 发送命令 /undeepseek online 自动下载（推荐）\n"
+            "  2) 执行 playwright install chromium\n"
+            "  3) 设置环境变量 UNDEEPSEEK_CHROME 指向 chrome.exe / msedge.exe"
+        )
+
+    # Playwright 子进程会继承带 \\?\ 前缀的 PATH（AstrBot 嵌入 E 盘所致），
+    # node 遇到该 UNC 前缀会报 EISDIR 启动失败。这里给子进程一份干净的 PATH。
+    _launch_env = dict(os.environ)
+    _changed = False
+    for _pkey in list(_launch_env.keys()):
+        if _pkey.upper() == "PATH":
+            _pv = _launch_env[_pkey]
+            _clean = re.sub(r"^\\\\\?\\\\?([A-Za-z]:)", r"\1", _pv)
+            if _clean != _pv:
+                _launch_env[_pkey] = _clean
+                _changed = True
+    if not _changed:
+        _launch_env = None
+
+    _pw = await async_playwright().start()
+    _browser = await _pw.chromium.launch(
+        executable_path=exe_path,
+        headless=True,
+        env=_launch_env,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    logger.info("[Browser] 常驻浏览器已启动（不关闭，会话 cookie 保活）")
+
+
 async def _ensure_page(account: str, password: str):
-    """确保浏览器已打开并处于登录状态，返回 page。"""
-    global _pw, _browser, _context, _page, _current_account, _force_rebuild
+    """确保该账号有可复用的已登录页面，返回 page。
+
+    按账号缓存独立 context/page：能登录的常驻复用，进不去的直接抛异常，
+    不保存任何 context 或 ck（由调用方标记「需登录」）。
+    """
     async with _lock:
-        # 仅当页面存活且当前登录账号一致且未标记强制重建时才复用
-        if (not _force_rebuild and _page is not None and not _page.is_closed()
-                and _current_account == account):
-            try:
-                await _page.title()  # 探活
-                return _page
-            except Exception:
-                pass
-        _force_rebuild = False  # 消费掉重建标记
-        _current_account = account
+        await _ensure_browser()
 
-        # Bug4: 换号/重建页面会丢失网页端上下文，清空活跃会话集合，
-        # 让后续同 session 请求重新喂入历史，避免上下文断裂。
-        _active_sessions.clear()
-
-        # Bug5: 关闭上一个账号的旧 context（换号重建时避免 context/页面泄漏）
-        if _context is not None:
+        cached = _account_sessions.get(account)
+        if (cached and cached.get("ok")
+                and not cached["page"].is_closed()):
             try:
-                await _context.close()
+                await cached["page"].title()  # 探活
+                return cached["page"]
             except Exception:  # noqa: BLE001
                 pass
-            _context = None
-            _page = None
 
-        if _browser is None or not _browser.is_connected():
-            # 浏览器内核路径在每次启动前重新探测：可能刚通过
-            # /undeepseek online 下载完，也可能是用户中途装了系统 Chrome
-            exe_path = refresh_chrome_exe()
-            if not exe_path:
-                raise RuntimeError(
-                    "未找到可用的浏览器内核。请任选一种方式：\n"
-                    "  1) 发送命令 /undeepseek online 自动下载（推荐）\n"
-                    "  2) 执行 playwright install chromium\n"
-                    "  3) 设置环境变量 UNDEEPSEEK_CHROME 指向 chrome.exe / msedge.exe"
-                )
-
-            # Playwright 子进程会继承带 \\?\ 前缀的 PATH（AstrBot 嵌入 E 盘所致），
-            # node 遇到该 UNC 前缀会报 EISDIR 启动失败。这里给子进程一份干净的
-            # PATH（把 \\?\E:\ 还原成 E:\），并在重启前记录一条日志便于排查。
-            _launch_env = dict(os.environ)
-            _changed = False
-            for _pkey in list(_launch_env.keys()):
-                if _pkey.upper() == "PATH":
-                    _pv = _launch_env[_pkey]
-                    _clean = re.sub(r"^\\\\\?\\\\?([A-Za-z]:)", r"\1", _pv)
-                    if _clean != _pv:
-                        _launch_env[_pkey] = _clean
-                        _changed = True
-            if not _changed:
-                _launch_env = None
-            _pw = await async_playwright().start()
-            _browser = await _pw.chromium.launch(
-                executable_path=exe_path,
-                headless=True,
-                env=_launch_env,
-                # 隐藏 Playwright 自动化痕迹（如 navigator.webdriver），
-                # 避免 DeepSeek 网页端把本插件识别为机器人进而风控/封号。
-                # 这是浏览器自动化插件的常规反检测配置，不影响任何安全边界。
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-
-        # 有登录态直接恢复，避免反复登录（按账号分文件）
-        state_path = _storage_path(account)
-        if os.path.exists(state_path):
-            _context = await _browser.new_context(
-                storage_state=state_path,
-                viewport={"width": 1280, "height": 800},
-                locale="zh-CN",
-            )
-        else:
-            _context = await _browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                locale="zh-CN",
-            )
-        _page = await _context.new_page()
-        await _page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=60000)
-
-        if not await _is_logged_in(_page):
-            await _do_login(_page, account, password)
+        # 该账号此前的 context 已不可用，丢弃（仅丢这一个账号，不影响其他账号）
+        if cached:
             try:
-                await _context.storage_state(path=state_path)
-                _restrict_permissions(state_path)
-                logger.info("[Browser] 登录态已保存到 %s", state_path)
-            except Exception as _e:  # noqa: BLE001
-                logger.warning("[Browser] 保存登录态失败: %s", _e)
+                await cached["context"].close()
+            except Exception:  # noqa: BLE001
+                pass
+            _account_sessions.pop(account, None)
+
+        # 新建该账号专属窗口
+        context = await _browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            locale="zh-CN",
+        )
+        page = await context.new_page()
+        await page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=60000)
+
+        if not await _is_logged_in(page):
+            # 登录失败会抛 LoginFailedError / ManualLoginRequiredError，
+            # 此时不把 context 放进池子、不写 ck —— 调用方据此标记「需登录」
+            try:
+                await _do_login(page, account, password)
+            except Exception:
+                try:
+                    await context.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+
+        # 能进：常驻保存这个窗口，并写一份 ck 快照（尽力而为）
+        _account_sessions[account] = {"context": context, "page": page, "ok": True}
+        state_path = _storage_path(account)
+        try:
+            await context.storage_state(path=state_path)
+            _restrict_permissions(state_path)
+            logger.info("[Browser] 账号 %s 登录态已保存并常驻: %s", account, state_path)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("[Browser] 保存登录态快照失败: %s", _e)
 
         # 登录后检测禁言提示（如账号已被禁言则抛异常触发换号）
         # 注意：只在可见的提示框/toast 里检测，不扫整个 body（避免误命中帮助文本等）
         try:
-            await _page.wait_for_timeout(2000)  # 等 2 秒让页面完全加载
+            await page.wait_for_timeout(2000)  # 等 2 秒让页面完全加载
             # 只检查 toast / 消息提示框 / dialog 类元素
-            ban_els = _page.locator(
+            ban_els = page.locator(
                 ".ant-message, .ant-notification, .ant-modal-body, "
                 ".toast, .alert, [role='alert'], [class*='toast'], [class*='message']"
             )
@@ -527,7 +537,7 @@ async def _ensure_page(account: str, password: str):
         except Exception:  # noqa: BLE001
             pass
 
-        return _page
+        return page
 
 
 async def _wait_reply(page, timeout: int, base_count: int = 0):
@@ -637,7 +647,6 @@ async def chat(
     会话(session_id)首次：先喂完整历史（丢弃其回复），再发最新问题并返回答案。
     会话后续：复用同一页面，只发最新消息（网页端自己记住历史），上下文连续、不反复新建。
     """
-    global _force_rebuild
     # 单页面全局共享，整个"发历史→发问题→等回复"流程必须串行执行
     async with _chat_lock:
         page = await _ensure_page(account, password)
@@ -662,18 +671,47 @@ async def chat(
             text = await _wait_reply(page, timeout, base)
             return text
         except TimeoutError:
-            # 会话被顶/超时：标记强制重建，让下次 _ensure_page 重新登录
-            _force_rebuild = True
+            # 会话被顶/超时：只让这个账号的窗口下次重建，不动其他账号的常驻登录态
+            invalidate_account(account)
             raise
 
 
+def adopt_session(account: str, context, page) -> None:
+    """把外部已登录成功的 context/page 收编进常驻池，供后续对话复用。"""
+    _account_sessions[account] = {"context": context, "page": page, "ok": True}
+    logger.info("[Browser] 账号 %s 的已登录窗口已纳管（常驻不关）", account)
+
+
+def invalidate_account(account: str) -> None:
+    """标记某账号的常驻窗口失效（下次会重新建），供外部/异常路径调用。"""
+    sess = _account_sessions.pop(account, None)
+    if sess:
+        try:
+            import asyncio as _a
+
+            loop = _a.get_running_loop()
+            loop.create_task(sess["context"].close())
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def close():
-    """关闭浏览器（可选的清理入口）。"""
-    global _pw, _browser, _context, _page
+    """关闭浏览器（插件卸载/重载时调用）。
+
+    注意：关掉浏览器会丢失所有账号的会话级 cookie，下次需重新登录。
+    """
+    global _pw, _browser
     async with _lock:
+        for account, sess in list(_account_sessions.items()):
+            try:
+                await sess["context"].close()
+            except Exception:  # noqa: BLE001
+                pass
+        _account_sessions.clear()
+        _active_sessions.clear()
         try:
             if _browser is not None:
                 await _browser.close()
         except Exception:  # noqa: BLE001
             pass
-        _page = _context = _browser = _pw = None
+        _browser = _pw = None
