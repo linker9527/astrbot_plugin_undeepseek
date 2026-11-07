@@ -28,19 +28,10 @@
   },
   "login_hint": {
     "type": "string",
-    "description": "⚠️ 需要预先登录的账号",
-    "hint": "首次使用的账号需先在此电脑的任意浏览器里完成一次 DeepSeek 网页登录（可能要求邮箱验证码/人机验证，插件无法自动完成）。登录过一次后本列表会自动清空。完成后点重载/保存，刷新列表。详细清单见插件配置页。",
+    "description": "⚠️ 待邮箱验证的账号",
+    "hint": "有账号需要在本机完成一次邮箱/人机验证时，请到插件配置页点「进行邮箱验证」，在弹出的浏览器里完成验证后点「重新检测」。列表不显示密码。",
     "default": "",
     "readonly": true,
-    "condition": {
-      "avoid_ban": true
-    }
-  },
-  "show_login_password": {
-    "type": "bool",
-    "description": "在待登录列表中显示明文密码",
-    "hint": "关闭后列表只显示账号。若插件需要复审，建议关闭此项（避免凭据在 WebUI 上展示）。",
-    "default": true,
     "condition": {
       "avoid_ban": true
     }

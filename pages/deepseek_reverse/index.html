@@ -107,21 +107,14 @@
     });
   </script>
 
-  <!-- 待人工登录账号清单：仅在浏览器模式开启时显示 -->
+  <!-- 待邮箱验证账号：仅在浏览器模式开启且有待验证账号时显示 -->
   <div class="card" id="pendingLoginCard" style="display:none;background:#fff3e0;border:2px solid #ff9800;">
-    <h2><span class="icon">⚠️</span> 请先登录以下账号</h2>
-    <p style="font-size:14px;color:#795548;margin-bottom:12px;">
-      DeepSeek 要求首次在新环境登录时完成邮箱验证码 / 人机验证，插件无法自动完成。
-      请在此电脑的任意浏览器里用下面的账号登录一次 DeepSeek 网页端，之后插件即可自动复用。
-    </p>
+    <h2><span class="icon">⚠️</span> 待邮箱验证的账号</h2>
     <div id="pendingLoginList"></div>
-    <p style="font-size:12px;color:#888;margin-top:14px;">
-      点重载 / 保存，刷新列表（登录成功后插件会自动清除对应账号）
-    </p>
   </div>
 
   <script>
-    (async function () {
+    (function () {
       const card = document.getElementById("pendingLoginCard");
       const list = document.getElementById("pendingLoginList");
       if (!card || !list) return;
@@ -129,67 +122,115 @@
       const bridge = window.AstrBotPluginPage;
       if (!bridge || typeof bridge.apiGet !== "function") return;
 
-      // 1) 读配置，判断浏览器模式是否开启、是否允许显示明文密码
-      let cfg = {}, showPwd = true, avoidBan = false;
-      try {
-        const ctx = bridge.getContext ? bridge.getContext() : {};
-        const pluginId = ctx.pluginName || "astrbot_plugin_undeepseek";
-        const res = await bridge.apiGet("/api/plugin/config", { plugin_id: pluginId });
-        const data = res && (res.data || res);
-        cfg = (data && data.config) || {};
-        avoidBan = !!cfg.avoid_ban;
-        showPwd = cfg.show_login_password !== false;
-      } catch (e) {
-        console.warn("[undeepseek] 读取配置失败:", e);
-      }
+      // apiGet/apiPost 会拼成 /api/v1/plugins/extensions/<plugin>/<endpoint>
+      const API = "astrbot_plugin_undeepseek/page";
 
-      // 2) 浏览器模式未开启则完全不显示
-      if (!avoidBan) { card.style.display = "none"; return; }
-
-      // 3) 读公开的「待登录账号名」清单（不含密码）
-      let pending = [];
-      try {
-        const r = await fetch("./pending_login.json", { cache: "no-store" });
-        if (r.ok) {
-          const j = await r.json();
-          pending = (j && j.accounts) || [];
+      async function loadPending() {
+        // 1) 读配置，只在浏览器模式开启时显示
+        let avoidBan = false;
+        try {
+          const ctx = bridge.getContext ? bridge.getContext() : {};
+          const pluginId = ctx.pluginName || "astrbot_plugin_undeepseek";
+          const res = await bridge.apiGet("/api/plugin/config", { plugin_id: pluginId });
+          const data = res && (res.data || res);
+          const cfg = (data && data.config) || {};
+          avoidBan = !!cfg.avoid_ban;
+        } catch (e) {
+          console.warn("[undeepseek] 读取配置失败:", e);
         }
-      } catch (e) {
-        console.warn("[undeepseek] 读取待登录清单失败:", e);
+        if (!avoidBan) { card.style.display = "none"; return []; }
+
+        // 2) 读公开清单（只含账号名，不含密码）
+        let pending = [];
+        try {
+          const r = await fetch("./pending_login.json", { cache: "no-store" });
+          if (r.ok) {
+            const j = await r.json();
+            pending = (j && j.accounts) || [];
+          }
+        } catch (e) {
+          console.warn("[undeepseek] 读取待验证清单失败:", e);
+        }
+        return pending;
       }
 
-      if (!pending.length) {
-        card.style.display = "none";
-        return;
+      function btnStyle() {
+        return "padding:5px 12px;margin-left:8px;border:1px solid #ff9800;border-radius:6px;" +
+               "background:#fff;color:#e65100;font-size:13px;cursor:pointer;white-space:nowrap;";
       }
 
-      // 4) 组装账号->密码映射（密码来自配置，不来自公开清单）
-      const pwdMap = {};
-      if (cfg.account && cfg.password) pwdMap[cfg.account] = cfg.password;
-      (cfg.extra_accounts || []).forEach(function (item) {
-        const i = String(item).indexOf(":");
-        if (i > 0) pwdMap[String(item).slice(0, i).trim()] = String(item).slice(i + 1).trim();
-      });
+      async function render() {
+        const pending = await loadPending();
+        if (!pending.length) { card.style.display = "none"; return; }
 
-      // 5) 渲染
-      card.style.display = "block";
-      list.innerHTML = "";
-      pending.forEach(function (p) {
-        const acc = p.account || "";
-        const pwd = pwdMap[acc] || "";
-        const row = document.createElement("div");
-        row.style.cssText = "padding:8px 12px;margin-bottom:8px;background:#fff;border-radius:6px;font-size:14px;";
-        // 用 DOM 节点而非 innerHTML 拼接，避免账号/密码里的特殊字符造成 XSS
-        row.appendChild(document.createTextNode("请先登录：账号 "));
-        const accEl = document.createElement("b");
-        accEl.textContent = acc;
-        row.appendChild(accEl);
-        row.appendChild(document.createTextNode("　密码 "));
-        const pwdEl = document.createElement("b");
-        pwdEl.textContent = (showPwd && pwd) ? pwd : "********";
-        row.appendChild(pwdEl);
-        list.appendChild(row);
-      });
+        card.style.display = "block";
+        list.innerHTML = "";
+
+        pending.forEach(function (p) {
+          const acc = p.account || "";
+          const row = document.createElement("div");
+          row.style.cssText =
+            "display:flex;align-items:center;justify-content:space-between;gap:8px;" +
+            "padding:10px 12px;margin-bottom:8px;background:#fff;border-radius:6px;font-size:14px;flex-wrap:wrap;";
+
+          const name = document.createElement("b");
+          name.textContent = acc;         // textContent，避免 XSS
+          row.appendChild(name);
+
+          const actions = document.createElement("div");
+          actions.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+
+          const start = document.createElement("button");
+          start.textContent = "进行邮箱验证";
+          start.style.cssText = btnStyle();
+          start.onclick = async function () {
+            start.disabled = true;
+            start.textContent = "打开中…";
+            try {
+              const r = await bridge.apiPost(API + "/login/start", { account: acc });
+              const d = r && (r.data || r);
+              if (d && d.status === "error") { alert(d.message || "打开失败"); }
+              else { start.textContent = "已打开"; }
+            } catch (e) {
+              alert("打开验证窗口失败: " + e);
+            } finally {
+              start.disabled = false;
+              if (start.textContent === "打开中…") start.textContent = "进行邮箱验证";
+            }
+          };
+
+          const recheck = document.createElement("button");
+          recheck.textContent = "重新检测";
+          recheck.style.cssText = btnStyle() + "border-color:#1976d2;color:#1565c0;";
+          recheck.onclick = async function () {
+            recheck.disabled = true;
+            recheck.textContent = "检测中…";
+            try {
+              const r = await bridge.apiPost(API + "/login/check", { account: acc });
+              const d = r && (r.data || r);
+              if (d && d.status === "ok" && d.data && d.data.logged_in) {
+                // 成功：保存 ck、窗口纳管、清单移除，刷新板块
+                await render();
+              } else {
+                alert((d && d.message) || "尚未登录成功，请在打开的浏览器里完成验证");
+                recheck.textContent = "重新检测";
+              }
+            } catch (e) {
+              alert("检测失败: " + e);
+              recheck.textContent = "重新检测";
+            } finally {
+              recheck.disabled = false;
+            }
+          };
+
+          actions.appendChild(start);
+          actions.appendChild(recheck);
+          row.appendChild(actions);
+          list.appendChild(row);
+        });
+      }
+
+      render();
     })();
   </script>
 </body>

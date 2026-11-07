@@ -273,6 +273,9 @@ _chat_lock = asyncio.Lock()
 # ok=True 表示该账号已确认可登录，其 page 一直复用，不再重建。
 _account_sessions: dict = {}
 
+# 被手动验证浏览器替换下来的旧 headless 浏览器，等 close() 时统一关掉
+_retired_browsers: list = []
+
 # 会话级 cookie 无法真正持久化，这里只做「尽力而为」的 ck 快照，
 # 供人工排查/导出用；重启后仍需重新登录。
 _active_sessions: set = set()
@@ -676,6 +679,22 @@ async def chat(
             raise
 
 
+def replace_browser(pw, browser) -> None:
+    """用外部已登录的浏览器（有头）替换常驻浏览器。
+
+    手动验证窗口是独立 Playwright 实例，context 无法跨实例复用；
+    验证成功后直接把整个浏览器升格为常驻浏览器，后续账号都在这里开窗口。
+    """
+    global _pw, _browser
+    old_browser, old_pw = _browser, _pw
+    _pw, _browser = pw, browser
+    if old_browser is not None and old_browser is not browser:
+        # 旧 headless 浏览器已无账号窗口在用，交给 close() 统一清理，
+        # 避免在没有运行中事件循环时 create_task 失败
+        _retired_browsers.append(old_browser)
+    logger.info("[Browser] 常驻浏览器已替换为手动验证通过的浏览器")
+
+
 def adopt_session(account: str, context, page) -> None:
     """把外部已登录成功的 context/page 收编进常驻池，供后续对话复用。"""
     _account_sessions[account] = {"context": context, "page": page, "ok": True}
@@ -709,6 +728,12 @@ async def close():
                 pass
         _account_sessions.clear()
         _active_sessions.clear()
+        for old in _retired_browsers:
+            try:
+                await old.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _retired_browsers.clear()
         try:
             if _browser is not None:
                 await _browser.close()

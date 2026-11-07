@@ -1116,6 +1116,17 @@ class Main(Star):
 
     def __init__(self, context, config=None):
         super().__init__(context, config)
+        # Star 基类不保存 config，PageApi 需要读取账号密码，这里自己留一份
+        self.plugin_config = config or {}
+
+        # 注册配置页后端 API（手动邮箱验证流程），与配置是否为空无关
+        try:
+            from .core.page_api import PageApi
+
+            self._page_api = PageApi(self)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"[PageApi] 注册失败: {type(e).__name__}: {e}")
+
         if not config:
             return
 
@@ -1493,6 +1504,9 @@ class Main(Star):
         # 插件卸载/重载时释放浏览器资源，否则 headless Chromium 会泄漏
         try:
             from .core import browser as browser_mod
+            from .core.page_api import close_all_manual
+
+            await close_all_manual()   # 先关未升格的有头验证窗口
             await browser_mod.close()
             self.logger.info("[terminate] 浏览器资源已释放")
         except Exception as e:
